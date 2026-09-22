@@ -17,6 +17,11 @@ jobs:
           echo '------'
 
       - name: Use my composite action
+        id: my-action
         uses: ./.github/actions/my-composite-action
         with:
           node-version: '18'
+
+      - name: Display result
+        run: | 
+          echo "Script Result: ${{ steps.my-action.outputs.script-result }}"          
