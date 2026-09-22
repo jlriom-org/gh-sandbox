@@ -2,12 +2,17 @@
 name: build
 
 on:
+  push:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - run: | 
+          ls -l -a
+          echo '------'
+
       - name: Use my composite action
         uses: ./.github/actions/my-composite-action
         with:
