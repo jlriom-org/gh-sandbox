@@ -1,0 +1,1577 @@
+name: GHAS Organization AS-IS Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      organization:
+        description: "GitHub organization to audit"
+        required: true
+        type: string
+
+      github_hostname:
+        description: "GitHub hostname"
+        required: false
+        default: "github.com"
+        type: string
+
+      include_archived:
+        description: "Include archived repositories"
+        required: false
+        default: false
+        type: boolean
+
+      stale_analysis_days:
+        description: "Consider CodeQL analysis stale after this number of days"
+        required: false
+        default: "30"
+        type: string
+
+      fail_on_gaps:
+        description: "Fail the workflow when critical GHAS gaps are detected"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  audit-ghas:
+    name: Audit GHAS organization
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      ORG: ${{ inputs.organization }}
+      GH_HOST: ${{ inputs.github_hostname }}
+      INCLUDE_ARCHIVED: ${{ inputs.include_archived }}
+      STALE_ANALYSIS_DAYS: ${{ inputs.stale_analysis_days }}
+      FAIL_ON_GAPS: ${{ inputs.fail_on_gaps }}
+      API_VERSION: "2022-11-28"
+      EVIDENCE_DIR: "ghas-evidence"
+
+    steps:
+      # =============================================================
+      # 1. Validate execution environment
+      # =============================================================
+
+      - name: Validate execution environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "GitHub CLI:"
+          gh --version
+
+          echo
+          echo "jq:"
+          jq --version
+
+          echo
+          echo "Python:"
+          python3 --version
+
+          if ! [[ "${STALE_ANALYSIS_DAYS}" =~ ^[0-9]+$ ]]; then
+            echo "::error::stale_analysis_days must be an integer"
+            exit 1
+          fi
+
+      # =============================================================
+      # 2. Authenticate GitHub CLI
+      # =============================================================
+
+      - name: Login to GitHub CLI
+        shell: bash
+        env:
+          GHAS_AUDIT_TOKEN: ${{ secrets.GHAS_AUDIT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GHAS_AUDIT_TOKEN:-}" ]]; then
+            echo "::error::Secret GHAS_AUDIT_TOKEN is not configured."
+            exit 1
+          fi
+
+          # gh gives precedence to GH_TOKEN and GITHUB_TOKEN. Remove
+          # them here so that authentication is performed explicitly.
+          unset GH_TOKEN || true
+          unset GITHUB_TOKEN || true
+
+          gh auth logout \
+            --hostname "${GH_HOST}" \
+            2>/dev/null || true
+
+          printf '%s' "${GHAS_AUDIT_TOKEN}" |
+            gh auth login \
+              --hostname "${GH_HOST}" \
+              --git-protocol https \
+              --with-token
+
+          echo "GitHub CLI authentication completed."
+
+      # =============================================================
+      # 3. Validate authentication and organization access
+      # =============================================================
+
+      - name: Validate authentication and organization access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh auth status --hostname "${GH_HOST}"
+
+          LOGIN=$(
+            gh api \
+              --hostname "${GH_HOST}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              /user \
+              --jq '.login'
+          )
+
+          echo "Authenticated GitHub identity: ${LOGIN}"
+
+          gh api \
+            --hostname "${GH_HOST}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: ${API_VERSION}" \
+            "/orgs/${ORG}" \
+            >/dev/null
+
+          echo "Access to organization ${ORG} validated."
+
+      # =============================================================
+      # 4. Create evidence structure
+      # =============================================================
+
+      - name: Create evidence structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${EVIDENCE_DIR}/organization"
+          mkdir -p "${EVIDENCE_DIR}/repositories"
+          mkdir -p "${EVIDENCE_DIR}/code-scanning"
+          mkdir -p "${EVIDENCE_DIR}/secret-scanning"
+          mkdir -p "${EVIDENCE_DIR}/dependabot"
+          mkdir -p "${EVIDENCE_DIR}/workflows"
+          mkdir -p "${EVIDENCE_DIR}/errors"
+
+          cat > "${EVIDENCE_DIR}/metadata.json" <<EOF
+          {
+            "organization": "${ORG}",
+            "github_host": "${GH_HOST}",
+            "generated_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "workflow_repository": "${GITHUB_REPOSITORY}",
+            "workflow_run_id": "${GITHUB_RUN_ID}",
+            "workflow_run_number": "${GITHUB_RUN_NUMBER}",
+            "include_archived": ${INCLUDE_ARCHIVED},
+            "stale_analysis_days": ${STALE_ANALYSIS_DAYS}
+          }
+          EOF
+
+      # =============================================================
+      # 5. Organization evidence
+      # =============================================================
+
+      - name: Collect organization evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh api \
+            --hostname "${GH_HOST}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: ${API_VERSION}" \
+            "/orgs/${ORG}" \
+            > "${EVIDENCE_DIR}/organization/organization.json"
+
+          if ! gh api \
+            --hostname "${GH_HOST}" \
+            --paginate \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: ${API_VERSION}" \
+            "/orgs/${ORG}/code-security/configurations?per_page=100" \
+            --slurp \
+            > "${EVIDENCE_DIR}/organization/code-security-configurations-pages.json"
+          then
+            echo '[]' \
+              > "${EVIDENCE_DIR}/organization/code-security-configurations-pages.json"
+
+            echo "Unable to retrieve organization code security configurations." \
+              > "${EVIDENCE_DIR}/errors/code-security-configurations.txt"
+          fi
+
+          jq '
+            if type == "array" then
+              [ .[] | if type == "array" then .[] else . end ]
+            else
+              []
+            end
+          ' "${EVIDENCE_DIR}/organization/code-security-configurations-pages.json" \
+            > "${EVIDENCE_DIR}/organization/code-security-configurations.json"
+
+          if ! gh api \
+            --hostname "${GH_HOST}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: ${API_VERSION}" \
+            "/orgs/${ORG}/code-security/configurations/defaults" \
+            > "${EVIDENCE_DIR}/organization/default-code-security-configurations.json"
+          then
+            echo '{}' \
+              > "${EVIDENCE_DIR}/organization/default-code-security-configurations.json"
+
+            echo "Unable to retrieve default code security configurations." \
+              > "${EVIDENCE_DIR}/errors/default-code-security-configurations.txt"
+          fi
+
+      # =============================================================
+      # 6. Repository inventory
+      # =============================================================
+
+      - name: Collect repository inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh api \
+            --hostname "${GH_HOST}" \
+            --paginate \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: ${API_VERSION}" \
+            "/orgs/${ORG}/repos?type=all&per_page=100" \
+            --slurp \
+            > "${EVIDENCE_DIR}/organization/repository-pages.json"
+
+          jq '
+            [
+              .[]
+              | if type == "array" then .[] else . end
+            ]
+          ' "${EVIDENCE_DIR}/organization/repository-pages.json" \
+            > "${EVIDENCE_DIR}/repositories.json"
+
+          if [[ "${INCLUDE_ARCHIVED}" != "true" ]]; then
+            jq '[.[] | select(.archived == false)]' \
+              "${EVIDENCE_DIR}/repositories.json" \
+              > "${EVIDENCE_DIR}/repositories-filtered.json"
+          else
+            cp \
+              "${EVIDENCE_DIR}/repositories.json" \
+              "${EVIDENCE_DIR}/repositories-filtered.json"
+          fi
+
+          jq -r '
+            .[]
+            | [
+                .name,
+                .full_name,
+                .visibility,
+                .archived,
+                .disabled,
+                .fork,
+                (.default_branch // ""),
+                (.language // ""),
+                .html_url
+              ]
+            | @tsv
+          ' "${EVIDENCE_DIR}/repositories-filtered.json" \
+            > "${EVIDENCE_DIR}/repositories.tsv"
+
+          REPOSITORY_COUNT=$(
+            jq 'length' "${EVIDENCE_DIR}/repositories-filtered.json"
+          )
+
+          echo "Repositories selected for audit: ${REPOSITORY_COUNT}"
+
+      # =============================================================
+      # 7. Collect repository-level GHAS evidence
+      # =============================================================
+
+      - name: Collect repository GHAS evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS=$'\t' read -r \
+            repo \
+            full_name \
+            visibility \
+            archived \
+            disabled \
+            fork \
+            default_branch \
+            primary_language \
+            html_url
+          do
+            echo "::group::Auditing ${full_name}"
+
+            SAFE_REPO=$(printf '%s' "${repo}" | sed 's/[^a-zA-Z0-9._-]/_/g')
+
+            REPO_DIR="${EVIDENCE_DIR}/repositories/${SAFE_REPO}"
+            CODE_DIR="${EVIDENCE_DIR}/code-scanning/${SAFE_REPO}"
+            SECRET_DIR="${EVIDENCE_DIR}/secret-scanning/${SAFE_REPO}"
+            DEPENDABOT_DIR="${EVIDENCE_DIR}/dependabot/${SAFE_REPO}"
+            WORKFLOW_DIR="${EVIDENCE_DIR}/workflows/${SAFE_REPO}"
+            ERROR_FILE="${EVIDENCE_DIR}/errors/${SAFE_REPO}.log"
+
+            mkdir -p \
+              "${REPO_DIR}" \
+              "${CODE_DIR}" \
+              "${SECRET_DIR}" \
+              "${DEPENDABOT_DIR}" \
+              "${WORKFLOW_DIR}"
+
+            touch "${ERROR_FILE}"
+
+            # -------------------------------------------------------
+            # Repository metadata and security_and_analysis
+            # -------------------------------------------------------
+
+            if ! gh api \
+              --hostname "${GH_HOST}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              "/repos/${ORG}/${repo}" \
+              > "${REPO_DIR}/repository.json"
+            then
+              echo "repository: unable to retrieve repository metadata" \
+                >> "${ERROR_FILE}"
+
+              echo '{}' > "${REPO_DIR}/repository.json"
+            fi
+
+            # -------------------------------------------------------
+            # Applied Code Security Configuration
+            # -------------------------------------------------------
+
+            if ! gh api \
+              --hostname "${GH_HOST}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              "/repos/${ORG}/${repo}/code-security-configuration" \
+              > "${REPO_DIR}/code-security-configuration.json"
+            then
+              echo "code-security-configuration: unavailable or unauthorized" \
+                >> "${ERROR_FILE}"
+
+              echo '{}' \
+                > "${REPO_DIR}/code-security-configuration.json"
+            fi
+
+            # -------------------------------------------------------
+            # CodeQL default setup
+            # -------------------------------------------------------
+
+            if ! gh api \
+              --hostname "${GH_HOST}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              "/repos/${ORG}/${repo}/code-scanning/default-setup" \
+              > "${CODE_DIR}/default-setup.json"
+            then
+              echo "codeql-default-setup: unavailable, disabled or unauthorized" \
+                >> "${ERROR_FILE}"
+
+              echo '{}' > "${CODE_DIR}/default-setup.json"
+            fi
+
+            # -------------------------------------------------------
+            # Code scanning analyses
+            # -------------------------------------------------------
+
+            if ! gh api \
+              --hostname "${GH_HOST}" \
+              --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              "/repos/${ORG}/${repo}/code-scanning/analyses?per_page=100" \
+              --slurp \
+              > "${CODE_DIR}/analyses-pages.json"
+            then
+              echo "code-scanning-analyses: unavailable or unauthorized" \
+                >> "${ERROR_FILE}"
+
+              echo '[]' > "${CODE_DIR}/analyses-pages.json"
+            fi
+
+            jq '
+              if type == "array" then
+                [ .[] | if type == "array" then .[] else . end ]
+              else
+                []
+              end
+            ' "${CODE_DIR}/analyses-pages.json" \
+              > "${CODE_DIR}/analyses.json"
+
+            # -------------------------------------------------------
+            # Code scanning alerts
+            # -------------------------------------------------------
+
+            if ! gh api \
+              --hostname "${GH_HOST}" \
+              --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              "/repos/${ORG}/${repo}/code-scanning/alerts?state=open&per_page=100" \
+              --slurp \
+              > "${CODE_DIR}/open-alerts-pages.json"
+            then
+              echo "code-scanning-alerts: unavailable or unauthorized" \
+                >> "${ERROR_FILE}"
+
+              echo '[]' > "${CODE_DIR}/open-alerts-pages.json"
+            fi
+
+            jq '
+              if type == "array" then
+                [ .[] | if type == "array" then .[] else . end ]
+              else
+                []
+              end
+            ' "${CODE_DIR}/open-alerts-pages.json" \
+              > "${CODE_DIR}/open-alerts.json"
+
+            # -------------------------------------------------------
+            # CodeQL databases
+            # -------------------------------------------------------
+
+            if ! gh api \
+              --hostname "${GH_HOST}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              "/repos/${ORG}/${repo}/code-scanning/codeql/databases" \
+              > "${CODE_DIR}/codeql-databases.json"
+            then
+              echo "codeql-databases: unavailable or unauthorized" \
+                >> "${ERROR_FILE}"
+
+              echo '[]' > "${CODE_DIR}/codeql-databases.json"
+            fi
+
+            # -------------------------------------------------------
+            # Secret scanning alerts
+            # -------------------------------------------------------
+
+            if ! gh api \
+              --hostname "${GH_HOST}" \
+              --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              "/repos/${ORG}/${repo}/secret-scanning/alerts?state=open&per_page=100" \
+              --slurp \
+              > "${SECRET_DIR}/open-alerts-pages.json"
+            then
+              echo "secret-scanning-alerts: unavailable or unauthorized" \
+                >> "${ERROR_FILE}"
+
+              echo '[]' > "${SECRET_DIR}/open-alerts-pages.json"
+            fi
+
+            jq '
+              if type == "array" then
+                [ .[] | if type == "array" then .[] else . end ]
+              else
+                []
+              end
+            ' "${SECRET_DIR}/open-alerts-pages.json" \
+              > "${SECRET_DIR}/open-alerts.json"
+
+            # -------------------------------------------------------
+            # Secret scanning scan history
+            # -------------------------------------------------------
+
+            if ! gh api \
+              --hostname "${GH_HOST}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              "/repos/${ORG}/${repo}/secret-scanning/scan-history" \
+              > "${SECRET_DIR}/scan-history.json"
+            then
+              echo "secret-scanning-history: unavailable or unauthorized" \
+                >> "${ERROR_FILE}"
+
+              echo '{}' > "${SECRET_DIR}/scan-history.json"
+            fi
+
+            # -------------------------------------------------------
+            # Dependabot alerts
+            # -------------------------------------------------------
+
+            if ! gh api \
+              --hostname "${GH_HOST}" \
+              --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              "/repos/${ORG}/${repo}/dependabot/alerts?state=open&per_page=100" \
+              --slurp \
+              > "${DEPENDABOT_DIR}/open-alerts-pages.json"
+            then
+              echo "dependabot-alerts: unavailable or unauthorized" \
+                >> "${ERROR_FILE}"
+
+              echo '[]' > "${DEPENDABOT_DIR}/open-alerts-pages.json"
+            fi
+
+            jq '
+              if type == "array" then
+                [ .[] | if type == "array" then .[] else . end ]
+              else
+                []
+              end
+            ' "${DEPENDABOT_DIR}/open-alerts-pages.json" \
+              > "${DEPENDABOT_DIR}/open-alerts.json"
+
+            # -------------------------------------------------------
+            # Workflow inventory
+            # -------------------------------------------------------
+
+            if ! gh api \
+              --hostname "${GH_HOST}" \
+              --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              "/repos/${ORG}/${repo}/actions/workflows?per_page=100" \
+              --slurp \
+              > "${WORKFLOW_DIR}/workflow-pages.json"
+            then
+              echo "actions-workflows: unavailable or unauthorized" \
+                >> "${ERROR_FILE}"
+
+              echo '[]' > "${WORKFLOW_DIR}/workflow-pages.json"
+            fi
+
+            jq '
+              [
+                .[]
+                | if type == "object" and has("workflows")
+                  then .workflows[]
+                  elif type == "array"
+                  then .[]
+                  else empty
+                  end
+              ]
+            ' "${WORKFLOW_DIR}/workflow-pages.json" \
+              > "${WORKFLOW_DIR}/workflows.json"
+
+            # -------------------------------------------------------
+            # Languages detected by GitHub
+            # -------------------------------------------------------
+
+            if ! gh api \
+              --hostname "${GH_HOST}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: ${API_VERSION}" \
+              "/repos/${ORG}/${repo}/languages" \
+              > "${REPO_DIR}/languages.json"
+            then
+              echo "languages: unable to retrieve repository languages" \
+                >> "${ERROR_FILE}"
+
+              echo '{}' > "${REPO_DIR}/languages.json"
+            fi
+
+            echo "::endgroup::"
+          done < "${EVIDENCE_DIR}/repositories.tsv"
+
+      # =============================================================
+      # 8. Generate normalized reports
+      # =============================================================
+
+      - name: Generate normalized GHAS reports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PYTHON'
+          import csv
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          evidence = Path(os.environ["EVIDENCE_DIR"])
+          stale_days = int(os.environ["STALE_ANALYSIS_DAYS"])
+
+          def load_json(path, default):
+              try:
+                  with open(path, "r", encoding="utf-8") as file:
+                      return json.load(file)
+              except (FileNotFoundError, json.JSONDecodeError):
+                  return default
+
+          def nested(data, *keys, default=None):
+              current = data
+
+              for key in keys:
+                  if not isinstance(current, dict):
+                      return default
+
+                  current = current.get(key)
+
+                  if current is None:
+                      return default
+
+              return current
+
+          def status_value(repository, name):
+              return nested(
+                  repository,
+                  "security_and_analysis",
+                  name,
+                  "status",
+                  default="unknown"
+              )
+
+          def severity_count(alerts, severity_paths):
+              counts = {
+                  "critical": 0,
+                  "high": 0,
+                  "medium": 0,
+                  "moderate": 0,
+                  "low": 0,
+                  "warning": 0,
+                  "note": 0,
+                  "unknown": 0
+              }
+
+              for alert in alerts:
+                  severity = None
+
+                  for path in severity_paths:
+                      value = alert
+
+                      for key in path:
+                          if not isinstance(value, dict):
+                              value = None
+                              break
+
+                          value = value.get(key)
+
+                      if value:
+                          severity = str(value).lower()
+                          break
+
+                  if not severity:
+                      severity = "unknown"
+
+                  counts[severity] = counts.get(severity, 0) + 1
+
+              return counts
+
+          repository_list = load_json(
+              evidence / "repositories-filtered.json",
+              []
+          )
+
+          rows = []
+          codeql_rows = []
+          secret_rows = []
+          dependabot_rows = []
+          configuration_rows = []
+          workflow_rows = []
+          alert_rows = []
+
+          now = datetime.now(timezone.utc)
+
+          for repository_index in repository_list:
+              repo = repository_index["name"]
+              safe_repo = "".join(
+                  character
+                  if character.isalnum() or character in "._-"
+                  else "_"
+                  for character in repo
+              )
+
+              repo_dir = evidence / "repositories" / safe_repo
+              code_dir = evidence / "code-scanning" / safe_repo
+              secret_dir = evidence / "secret-scanning" / safe_repo
+              dependabot_dir = evidence / "dependabot" / safe_repo
+              workflow_dir = evidence / "workflows" / safe_repo
+              error_file = evidence / "errors" / f"{safe_repo}.log"
+
+              repository = load_json(
+                  repo_dir / "repository.json",
+                  {}
+              )
+
+              configuration = load_json(
+                  repo_dir / "code-security-configuration.json",
+                  {}
+              )
+
+              default_setup = load_json(
+                  code_dir / "default-setup.json",
+                  {}
+              )
+
+              analyses = load_json(
+                  code_dir / "analyses.json",
+                  []
+              )
+
+              code_alerts = load_json(
+                  code_dir / "open-alerts.json",
+                  []
+              )
+
+              databases = load_json(
+                  code_dir / "codeql-databases.json",
+                  []
+              )
+
+              secret_alerts = load_json(
+                  secret_dir / "open-alerts.json",
+                  []
+              )
+
+              secret_history = load_json(
+                  secret_dir / "scan-history.json",
+                  {}
+              )
+
+              dependabot_alerts = load_json(
+                  dependabot_dir / "open-alerts.json",
+                  []
+              )
+
+              languages = load_json(
+                  repo_dir / "languages.json",
+                  {}
+              )
+
+              workflows = load_json(
+                  workflow_dir / "workflows.json",
+                  []
+              )
+
+              errors = ""
+
+              if error_file.exists():
+                  errors = error_file.read_text(
+                      encoding="utf-8"
+                  ).strip().replace("\n", " | ")
+
+              advanced_security = status_value(
+                  repository,
+                  "advanced_security"
+              )
+
+              secret_scanning = status_value(
+                  repository,
+                  "secret_scanning"
+              )
+
+              push_protection = status_value(
+                  repository,
+                  "secret_scanning_push_protection"
+              )
+
+              validity_checks = status_value(
+                  repository,
+                  "secret_scanning_validity_checks"
+              )
+
+              non_provider_patterns = status_value(
+                  repository,
+                  "secret_scanning_non_provider_patterns"
+              )
+
+              dependabot_security_updates = status_value(
+                  repository,
+                  "dependabot_security_updates"
+              )
+
+              dependency_graph = status_value(
+                  repository,
+                  "dependency_graph"
+              )
+
+              config_object = configuration.get(
+                  "configuration",
+                  configuration
+              )
+
+              if not isinstance(config_object, dict):
+                  config_object = {}
+
+              configuration_id = config_object.get("id", "")
+              configuration_name = config_object.get("name", "")
+              configuration_target_type = config_object.get(
+                  "target_type",
+                  ""
+              )
+
+              default_setup_state = default_setup.get(
+                  "state",
+                  "unknown"
+              )
+
+              default_setup_languages = default_setup.get(
+                  "languages",
+                  []
+              ) or []
+
+              default_setup_query_suite = default_setup.get(
+                  "query_suite",
+                  ""
+              )
+
+              codeql_analyses = [
+                  analysis
+                  for analysis in analyses
+                  if str(analysis.get("tool", {}).get("name", "")).lower()
+                  == "codeql"
+              ]
+
+              successful_codeql = [
+                  analysis
+                  for analysis in codeql_analyses
+                  if analysis.get("error") in (None, "")
+              ]
+
+              last_analysis = None
+
+              if successful_codeql:
+                  successful_codeql.sort(
+                      key=lambda item: item.get("created_at", ""),
+                      reverse=True
+                  )
+                  last_analysis = successful_codeql[0]
+
+              last_analysis_at = ""
+              last_analysis_age_days = ""
+              last_analysis_status = "never"
+
+              if last_analysis:
+                  last_analysis_at = last_analysis.get(
+                      "created_at",
+                      ""
+                  )
+
+                  if last_analysis_at:
+                      parsed = datetime.fromisoformat(
+                          last_analysis_at.replace("Z", "+00:00")
+                      )
+
+                      age = now - parsed
+                      last_analysis_age_days = age.days
+                      last_analysis_status = (
+                          "stale"
+                          if age.days > stale_days
+                          else "current"
+                      )
+
+              repository_languages = sorted(languages.keys())
+
+              database_languages = sorted({
+                  str(database.get("language", ""))
+                  for database in databases
+                  if database.get("language")
+              })
+
+              analysis_languages = sorted({
+                  str(analysis.get("language", ""))
+                  for analysis in codeql_analyses
+                  if analysis.get("language")
+              })
+
+              codeql_languages = sorted(
+                  set(database_languages)
+                  | set(analysis_languages)
+                  | set(default_setup_languages)
+              )
+
+              codeql_workflows = [
+                  workflow
+                  for workflow in workflows
+                  if "codeql" in (
+                      str(workflow.get("name", ""))
+                      + " "
+                      + str(workflow.get("path", ""))
+                  ).lower()
+              ]
+
+              code_severity = severity_count(
+                  code_alerts,
+                  [
+                      ("rule", "security_severity_level"),
+                      ("rule", "severity")
+                  ]
+              )
+
+              dependabot_severity = severity_count(
+                  dependabot_alerts,
+                  [
+                      (
+                          "security_advisory",
+                          "severity"
+                      )
+                  ]
+              )
+
+              secret_push_bypassed = sum(
+                  1
+                  for alert in secret_alerts
+                  if alert.get("push_protection_bypassed") is True
+              )
+
+              critical_gaps = []
+
+              if advanced_security not in ("enabled", "unknown"):
+                  critical_gaps.append("advanced_security_disabled")
+
+              if secret_scanning not in ("enabled", "unknown"):
+                  critical_gaps.append("secret_scanning_disabled")
+
+              if push_protection not in ("enabled", "unknown"):
+                  critical_gaps.append("push_protection_disabled")
+
+              if not codeql_analyses and default_setup_state != "configured":
+                  critical_gaps.append("codeql_not_detected")
+
+              if last_analysis_status == "stale":
+                  critical_gaps.append("codeql_analysis_stale")
+
+              if code_severity.get("critical", 0) > 0:
+                  critical_gaps.append("critical_code_scanning_alerts")
+
+              if dependabot_severity.get("critical", 0) > 0:
+                  critical_gaps.append("critical_dependabot_alerts")
+
+              if len(secret_alerts) > 0:
+                  critical_gaps.append("open_secret_scanning_alerts")
+
+              inaccessible = bool(errors)
+
+              if critical_gaps:
+                  overall_status = "gap"
+              elif inaccessible:
+                  overall_status = "needs_review"
+              elif (
+                  advanced_security == "enabled"
+                  and secret_scanning == "enabled"
+                  and push_protection == "enabled"
+                  and (
+                      codeql_analyses
+                      or default_setup_state == "configured"
+                  )
+              ):
+                  overall_status = "compliant"
+              else:
+                  overall_status = "needs_review"
+
+              row = {
+                  "repository": repo,
+                  "full_name": repository_index.get(
+                      "full_name",
+                      ""
+                  ),
+                  "visibility": repository_index.get(
+                      "visibility",
+                      ""
+                  ),
+                  "archived": repository_index.get(
+                      "archived",
+                      False
+                  ),
+                  "fork": repository_index.get(
+                      "fork",
+                      False
+                  ),
+                  "default_branch": repository_index.get(
+                      "default_branch",
+                      ""
+                  ),
+                  "advanced_security": advanced_security,
+                  "secret_scanning": secret_scanning,
+                  "push_protection": push_protection,
+                  "validity_checks": validity_checks,
+                  "non_provider_patterns": non_provider_patterns,
+                  "dependabot_security_updates": dependabot_security_updates,
+                  "dependency_graph": dependency_graph,
+                  "configuration_id": configuration_id,
+                  "configuration_name": configuration_name,
+                  "configuration_target_type": configuration_target_type,
+                  "codeql_default_setup": default_setup_state,
+                  "codeql_query_suite": default_setup_query_suite,
+                  "codeql_analysis_count": len(codeql_analyses),
+                  "codeql_last_analysis": last_analysis_at,
+                  "codeql_analysis_age_days": last_analysis_age_days,
+                  "codeql_analysis_status": last_analysis_status,
+                  "repository_languages": ";".join(
+                      repository_languages
+                  ),
+                  "codeql_languages": ";".join(
+                      codeql_languages
+                  ),
+                  "codeql_workflow_count": len(codeql_workflows),
+                  "code_scanning_open_alerts": len(code_alerts),
+                  "code_scanning_critical": code_severity.get(
+                      "critical",
+                      0
+                  ),
+                  "code_scanning_high": code_severity.get(
+                      "high",
+                      0
+                  ),
+                  "secret_scanning_open_alerts": len(secret_alerts),
+                  "secret_push_protection_bypassed": secret_push_bypassed,
+                  "dependabot_open_alerts": len(dependabot_alerts),
+                  "dependabot_critical": dependabot_severity.get(
+                      "critical",
+                      0
+                  ),
+                  "dependabot_high": dependabot_severity.get(
+                      "high",
+                      0
+                  ),
+                  "critical_gap_count": len(critical_gaps),
+                  "critical_gaps": ";".join(critical_gaps),
+                  "api_errors": errors,
+                  "overall_status": overall_status,
+                  "repository_url": repository_index.get(
+                      "html_url",
+                      ""
+                  )
+              }
+
+              rows.append(row)
+
+              codeql_rows.append({
+                  "repository": repo,
+                  "default_setup_state": default_setup_state,
+                  "query_suite": default_setup_query_suite,
+                  "analysis_count": len(codeql_analyses),
+                  "last_analysis": last_analysis_at,
+                  "analysis_age_days": last_analysis_age_days,
+                  "analysis_status": last_analysis_status,
+                  "repository_languages": ";".join(
+                      repository_languages
+                  ),
+                  "codeql_languages": ";".join(
+                      codeql_languages
+                  ),
+                  "codeql_database_count": len(databases),
+                  "codeql_workflow_count": len(codeql_workflows),
+                  "open_alerts": len(code_alerts),
+                  "critical_alerts": code_severity.get(
+                      "critical",
+                      0
+                  ),
+                  "high_alerts": code_severity.get(
+                      "high",
+                      0
+                  )
+              })
+
+              secret_rows.append({
+                  "repository": repo,
+                  "secret_scanning": secret_scanning,
+                  "push_protection": push_protection,
+                  "validity_checks": validity_checks,
+                  "non_provider_patterns": non_provider_patterns,
+                  "open_alerts": len(secret_alerts),
+                  "push_protection_bypassed": secret_push_bypassed,
+                  "scan_history_available": bool(secret_history)
+              })
+
+              dependabot_rows.append({
+                  "repository": repo,
+                  "dependency_graph": dependency_graph,
+                  "dependabot_security_updates": dependabot_security_updates,
+                  "open_alerts": len(dependabot_alerts),
+                  "critical_alerts": dependabot_severity.get(
+                      "critical",
+                      0
+                  ),
+                  "high_alerts": dependabot_severity.get(
+                      "high",
+                      0
+                  )
+              })
+
+              configuration_rows.append({
+                  "repository": repo,
+                  "configuration_id": configuration_id,
+                  "configuration_name": configuration_name,
+                  "configuration_target_type": configuration_target_type
+              })
+
+              for workflow in workflows:
+                  workflow_rows.append({
+                      "repository": repo,
+                      "workflow_id": workflow.get("id", ""),
+                      "name": workflow.get("name", ""),
+                      "path": workflow.get("path", ""),
+                      "state": workflow.get("state", ""),
+                      "created_at": workflow.get("created_at", ""),
+                      "updated_at": workflow.get("updated_at", ""),
+                      "is_codeql_candidate": (
+                          "codeql" in (
+                              str(workflow.get("name", ""))
+                              + " "
+                              + str(workflow.get("path", ""))
+                          ).lower()
+                      )
+                  })
+
+              for alert in code_alerts:
+                  alert_rows.append({
+                      "repository": repo,
+                      "alert_type": "code_scanning",
+                      "alert_number": alert.get("number", ""),
+                      "state": alert.get("state", ""),
+                      "severity": nested(
+                          alert,
+                          "rule",
+                          "security_severity_level",
+                          default=nested(
+                              alert,
+                              "rule",
+                              "severity",
+                              default=""
+                          )
+                      ),
+                      "created_at": alert.get("created_at", ""),
+                      "dismissed_reason": alert.get(
+                          "dismissed_reason",
+                          ""
+                      ),
+                      "url": alert.get("html_url", "")
+                  })
+
+              for alert in secret_alerts:
+                  alert_rows.append({
+                      "repository": repo,
+                      "alert_type": "secret_scanning",
+                      "alert_number": alert.get("number", ""),
+                      "state": alert.get("state", ""),
+                      "severity": "",
+                      "created_at": alert.get("created_at", ""),
+                      "dismissed_reason": alert.get(
+                          "resolution",
+                          ""
+                      ),
+                      "url": alert.get("html_url", "")
+                  })
+
+              for alert in dependabot_alerts:
+                  alert_rows.append({
+                      "repository": repo,
+                      "alert_type": "dependabot",
+                      "alert_number": alert.get("number", ""),
+                      "state": alert.get("state", ""),
+                      "severity": nested(
+                          alert,
+                          "security_advisory",
+                          "severity",
+                          default=""
+                      ),
+                      "created_at": alert.get("created_at", ""),
+                      "dismissed_reason": nested(
+                          alert,
+                          "dismissed_reason",
+                          default=""
+                      ),
+                      "url": alert.get("html_url", "")
+                  })
+
+          def write_csv(filename, data):
+              path = evidence / filename
+
+              if not data:
+                  path.write_text("", encoding="utf-8")
+                  return
+
+              with open(
+                  path,
+                  "w",
+                  newline="",
+                  encoding="utf-8"
+              ) as file:
+                  writer = csv.DictWriter(
+                      file,
+                      fieldnames=list(data[0].keys())
+                  )
+                  writer.writeheader()
+                  writer.writerows(data)
+
+          write_csv("ghas-summary.csv", rows)
+          write_csv("codeql.csv", codeql_rows)
+          write_csv("secret-scanning.csv", secret_rows)
+          write_csv("dependabot.csv", dependabot_rows)
+          write_csv(
+              "code-security-configurations.csv",
+              configuration_rows
+          )
+          write_csv("workflows.csv", workflow_rows)
+          write_csv("alerts.csv", alert_rows)
+
+          summary = {
+              "generated_at": now.isoformat(),
+              "organization": os.environ["ORG"],
+              "repository_count": len(rows),
+              "compliant": sum(
+                  1
+                  for row in rows
+                  if row["overall_status"] == "compliant"
+              ),
+              "gaps": sum(
+                  1
+                  for row in rows
+                  if row["overall_status"] == "gap"
+              ),
+              "needs_review": sum(
+                  1
+                  for row in rows
+                  if row["overall_status"] == "needs_review"
+              ),
+              "advanced_security_enabled": sum(
+                  1
+                  for row in rows
+                  if row["advanced_security"] == "enabled"
+              ),
+              "secret_scanning_enabled": sum(
+                  1
+                  for row in rows
+                  if row["secret_scanning"] == "enabled"
+              ),
+              "push_protection_enabled": sum(
+                  1
+                  for row in rows
+                  if row["push_protection"] == "enabled"
+              ),
+              "codeql_detected": sum(
+                  1
+                  for row in rows
+                  if row["codeql_analysis_count"] > 0
+                  or row["codeql_default_setup"] == "configured"
+              ),
+              "stale_codeql": sum(
+                  1
+                  for row in rows
+                  if row["codeql_analysis_status"] == "stale"
+              ),
+              "open_code_scanning_alerts": sum(
+                  row["code_scanning_open_alerts"]
+                  for row in rows
+              ),
+              "open_secret_scanning_alerts": sum(
+                  row["secret_scanning_open_alerts"]
+                  for row in rows
+              ),
+              "open_dependabot_alerts": sum(
+                  row["dependabot_open_alerts"]
+                  for row in rows
+              )
+          }
+
+          with open(
+              evidence / "summary.json",
+              "w",
+              encoding="utf-8"
+          ) as file:
+              json.dump(
+                  summary,
+                  file,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+          with open(
+              evidence / "ghas-summary.json",
+              "w",
+              encoding="utf-8"
+          ) as file:
+              json.dump(
+                  rows,
+                  file,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+          print(json.dumps(summary, indent=2))
+          PYTHON
+
+      # =============================================================
+      # 9. Generate audit Markdown
+      # =============================================================
+
+      - name: Generate audit report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PYTHON'
+          import csv
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = Path(os.environ["EVIDENCE_DIR"])
+
+          with open(
+              evidence / "summary.json",
+              encoding="utf-8"
+          ) as file:
+              summary = json.load(file)
+
+          with open(
+              evidence / "ghas-summary.csv",
+              encoding="utf-8"
+          ) as file:
+              rows = list(csv.DictReader(file))
+
+          def percentage(value, total):
+              if total == 0:
+                  return "0.0%"
+
+              return f"{(value / total) * 100:.1f}%"
+
+          total = summary["repository_count"]
+
+          lines = [
+              "# GHAS Organization AS-IS Audit",
+              "",
+              f"**Organization:** {summary['organization']}",
+              "",
+              f"**Repositories audited:** {total}",
+              "",
+              "## Coverage overview",
+              "",
+              "| Control | Repositories | Coverage |",
+              "|---|---:|---:|",
+              (
+                  "| Advanced Security enabled "
+                  f"| {summary['advanced_security_enabled']} "
+                  f"| {percentage(summary['advanced_security_enabled'], total)} |"
+              ),
+              (
+                  "| Secret Scanning enabled "
+                  f"| {summary['secret_scanning_enabled']} "
+                  f"| {percentage(summary['secret_scanning_enabled'], total)} |"
+              ),
+              (
+                  "| Push Protection enabled "
+                  f"| {summary['push_protection_enabled']} "
+                  f"| {percentage(summary['push_protection_enabled'], total)} |"
+              ),
+              (
+                  "| CodeQL detected "
+                  f"| {summary['codeql_detected']} "
+                  f"| {percentage(summary['codeql_detected'], total)} |"
+              ),
+              "",
+              "## Overall assessment",
+              "",
+              "| Status | Repositories |",
+              "|---|---:|",
+              f"| Compliant | {summary['compliant']} |",
+              f"| Gap | {summary['gaps']} |",
+              f"| Needs review | {summary['needs_review']} |",
+              "",
+              "## Open security alerts",
+              "",
+              "| Alert source | Open alerts |",
+              "|---|---:|",
+              (
+                  "| Code Scanning "
+                  f"| {summary['open_code_scanning_alerts']} |"
+              ),
+              (
+                  "| Secret Scanning "
+                  f"| {summary['open_secret_scanning_alerts']} |"
+              ),
+              (
+                  "| Dependabot "
+                  f"| {summary['open_dependabot_alerts']} |"
+              ),
+              "",
+              "## Repository assessment",
+              "",
+              (
+                  "| Repository | Status | GHAS | Secret Scanning "
+                  "| Push Protection | CodeQL | Last analysis | Gaps |"
+              ),
+              "|---|---|---|---|---|---|---|---|"
+          ]
+
+          for row in rows:
+              analysis = (
+                  row["codeql_last_analysis"]
+                  if row["codeql_last_analysis"]
+                  else "Never detected"
+              )
+
+              gaps = (
+                  row["critical_gaps"]
+                  if row["critical_gaps"]
+                  else "None"
+              )
+
+              lines.append(
+                  f"| {row['repository']} "
+                  f"| {row['overall_status']} "
+                  f"| {row['advanced_security']} "
+                  f"| {row['secret_scanning']} "
+                  f"| {row['push_protection']} "
+                  f"| {row['codeql_default_setup']} "
+                  f"| {analysis} "
+                  f"| {gaps} |"
+              )
+
+          lines.extend([
+              "",
+              "## Interpretation notes",
+              "",
+              (
+                  "- `unknown` normally means that the API did not expose "
+                  "the setting or that the audit identity lacks permission."
+              ),
+              (
+                  "- `CodeQL detected` means that default setup is configured "
+                  "or at least one CodeQL analysis was found."
+              ),
+              (
+                  "- A stale analysis is older than "
+                  f"{os.environ['STALE_ANALYSIS_DAYS']} days."
+              ),
+              (
+                  "- Workflow-name detection is supporting evidence only. "
+                  "The source of truth for successful scanning is the "
+                  "code-scanning analyses API."
+              ),
+              (
+                  "- Public repositories can expose code scanning even when "
+                  "the `advanced_security` setting is not returned as enabled."
+              )
+          ])
+
+          report = "\n".join(lines) + "\n"
+
+          (evidence / "README.md").write_text(
+              report,
+              encoding="utf-8"
+          )
+
+          with open(
+              os.environ["GITHUB_STEP_SUMMARY"],
+              "a",
+              encoding="utf-8"
+          ) as summary_file:
+              summary_file.write(report)
+          PYTHON
+
+      # =============================================================
+      # 10. Validate generated evidence
+      # =============================================================
+
+      - name: Validate evidence package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required_files=(
+            "${EVIDENCE_DIR}/metadata.json"
+            "${EVIDENCE_DIR}/summary.json"
+            "${EVIDENCE_DIR}/ghas-summary.csv"
+            "${EVIDENCE_DIR}/ghas-summary.json"
+            "${EVIDENCE_DIR}/codeql.csv"
+            "${EVIDENCE_DIR}/secret-scanning.csv"
+            "${EVIDENCE_DIR}/dependabot.csv"
+            "${EVIDENCE_DIR}/alerts.csv"
+            "${EVIDENCE_DIR}/workflows.csv"
+            "${EVIDENCE_DIR}/README.md"
+          )
+
+          for required_file in "${required_files[@]}"
+          do
+            if [[ ! -f "${required_file}" ]]; then
+              echo "::error::Required evidence file missing: ${required_file}"
+              exit 1
+            fi
+          done
+
+          jq empty "${EVIDENCE_DIR}/summary.json"
+          jq empty "${EVIDENCE_DIR}/ghas-summary.json"
+
+          echo "Evidence package validated."
+
+          echo
+          echo "Generated evidence:"
+          find "${EVIDENCE_DIR}" \
+            -maxdepth 3 \
+            -type f \
+            | sort
+
+      # =============================================================
+      # 11. Create compressed evidence package
+      # =============================================================
+
+      - name: Create compressed evidence package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE_NAME="ghas-evidence-${ORG}-${GITHUB_RUN_ID}.tar.gz"
+
+          tar \
+            -czf "${ARCHIVE_NAME}" \
+            "${EVIDENCE_DIR}"
+
+          sha256sum "${ARCHIVE_NAME}" \
+            > "${ARCHIVE_NAME}.sha256"
+
+          cp "${ARCHIVE_NAME}.sha256" \
+            "${EVIDENCE_DIR}/evidence-package.sha256"
+
+      # =============================================================
+      # 12. Upload audit evidence
+      # =============================================================
+
+      - name: Upload GHAS audit evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghas-evidence-${{ inputs.organization }}-${{ github.run_id }}
+          path: |
+            ghas-evidence/
+            ghas-evidence-${{ inputs.organization }}-${{ github.run_id }}.tar.gz
+            ghas-evidence-${{ inputs.organization }}-${{ github.run_id }}.tar.gz.sha256
+          retention-days: 90
+          if-no-files-found: error
+
+      # =============================================================
+      # 13. Optional quality gate
+      # =============================================================
+
+      - name: Evaluate GHAS quality gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "${EVIDENCE_DIR}/summary.json" ]]; then
+            echo "::error::The audit summary was not generated."
+            exit 1
+          fi
+
+          GAP_COUNT=$(
+            jq -r '.gaps' "${EVIDENCE_DIR}/summary.json"
+          )
+
+          REVIEW_COUNT=$(
+            jq -r '.needs_review' "${EVIDENCE_DIR}/summary.json"
+          )
+
+          echo "Repositories with critical gaps: ${GAP_COUNT}"
+          echo "Repositories needing review: ${REVIEW_COUNT}"
+
+          if [[ "${FAIL_ON_GAPS}" == "true" && "${GAP_COUNT}" -gt 0 ]]; then
+            echo "::error::GHAS critical gaps detected in ${GAP_COUNT} repositories."
+            exit 1
+          fi
+
+          if [[ "${GAP_COUNT}" -gt 0 ]]; then
+            echo "::warning::GHAS gaps detected. Review the evidence artifact."
+          fi
