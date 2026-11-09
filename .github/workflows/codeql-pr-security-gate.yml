@@ -1,0 +1,79 @@
+name: CodeQL PR Security Gate
+
+on:
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+  # Permite ejecutar manualmente el análisis.
+  workflow_dispatch:
+
+  # Análisis periódico para controlar la deuda existente.
+  # Este análisis no debe configurarse como required check del PR.
+  schedule:
+    - cron: "30 2 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  packages: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+  
+jobs:
+   
+  codeql-analysis:
+    name: CodeQL - ${{ matrix.language }}
+    runs-on: ubuntu-latest
+
+    # Evita consumir recursos en Pull Requests que siguen en borrador.
+    if: >
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          # Ajustar a los lenguajes reales del repositorio.
+          #
+          # Valores habituales:
+          # - c-cpp
+          # - csharp
+          # - go
+          # - java-kotlin
+          # - javascript-typescript
+          # - python
+          # - ruby
+          # - swift
+          - javascript-typescript
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+
+          # security-extended amplía la detección respecto de default.
+          queries: security-extended
+
+      # Para lenguajes compilados, sustituir autobuild por los comandos
+      # de compilación reales cuando sea necesario.
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
