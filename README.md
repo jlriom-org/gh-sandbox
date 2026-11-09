@@ -1,6 +1,5 @@
 # gh-sandbox
 
-
 ## Prevent new vulnerabilities
 
 Como experto en GitHub Actions y GHAS,
