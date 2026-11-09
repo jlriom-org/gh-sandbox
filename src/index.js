@@ -29,3 +29,22 @@ app.get("/execute", (req, res) => {
     // This is a comment at the end of the function
 
 });
+
+const _ = require("lodash");
+
+function mergeUserPreferences(userPreferences) {
+    const defaults = {
+        theme: "light",
+        language: "en",
+        notifications: true
+    };
+
+    return _.defaultsDeep({}, userPreferences, defaults);
+}
+
+// Normal application usage
+const preferences = mergeUserPreferences({
+    theme: "dark"
+});
+
+console.log("User preferences:", preferences);
