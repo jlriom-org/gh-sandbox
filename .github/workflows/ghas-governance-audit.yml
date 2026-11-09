@@ -1,0 +1,212 @@
+name: GHES GHAS Organization Governance Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      organization:
+        description: "GHES organization to audit"
+        required: true
+        type: string
+
+      github_hostname:
+        description: "GHES hostname without https://"
+        required: true
+        type: string
+
+      fail_on_gaps:
+        description: "Fail the workflow when governance gaps are detected"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  ghas-governance-audit:
+    name: Confirm GHAS availability, repositories and security officers
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 120
+
+    env:
+      GH_HOST: ${{ inputs.github_hostname }}
+      ORG: ${{ inputs.organization }}
+      FAIL_ON_GAPS: ${{ inputs.fail_on_gaps }}
+
+      API_VERSION: "2022-11-28"
+      EVIDENCE_DIR: "ghas-governance-evidence"
+
+    steps:
+      # ============================================================
+      # 1. Validate tools
+      # ============================================================
+
+      - name: Validate runner tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUIRED_COMMANDS=(
+            gh
+            jq
+            curl
+            python3
+            tar
+            sha256sum
+          )
+
+          for COMMAND_NAME in "${REQUIRED_COMMANDS[@]}"
+          do
+            if ! command -v "${COMMAND_NAME}" >/dev/null 2>&1
+            then
+              echo "::error::Required command is not installed: ${COMMAND_NAME}"
+              exit 1
+            fi
+          done
+
+          echo "GitHub CLI:"
+          gh --version
+
+          echo
+          echo "jq:"
+          jq --version
+
+          echo
+          echo "Python:"
+          python3 --version
+
+      # ============================================================
+      # 2. Validate inputs
+      # ============================================================
+
+      - name: Validate workflow inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${ORG}" ]]
+          then
+            echo "::error::organization cannot be empty."
+            exit 1
+          fi
+
+          if [[ -z "${GH_HOST}" ]]
+          then
+            echo "::error::github_hostname cannot be empty."
+            exit 1
+          fi
+
+          if [[ "${GH_HOST}" == http://* || "${GH_HOST}" == https://* ]]
+          then
+            echo "::error::github_hostname must not contain http:// or https://"
+            exit 1
+          fi
+
+          if [[ "${GH_HOST}" == */* ]]
+          then
+            echo "::error::github_hostname must contain only the hostname."
+            exit 1
+          fi
+
+          if [[ ! "${ORG}" =~ ^[A-Za-z0-9._-]+$ ]]
+          then
+            echo "::error::organization contains unsupported characters."
+            exit 1
+          fi
+
+          echo "GHES hostname: ${GH_HOST}"
+          echo "Organization: ${ORG}"
+
+      # ============================================================
+      # 3. Test GHES connectivity
+      # ============================================================
+
+      - name: Test GHES connectivity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Resolving ${GH_HOST}..."
+
+          if ! getent hosts "${GH_HOST}" >/tmp/ghes-dns.txt
+          then
+            echo "::error::The GitHub-hosted runner cannot resolve ${GH_HOST}."
+            echo "::error::Confirm that GHES is publicly resolvable and reachable."
+            exit 1
+          fi
+
+          cat /tmp/ghes-dns.txt
+
+          echo
+          echo "Testing the GHES REST API..."
+
+          HTTP_STATUS=$(
+            curl \
+              --silent \
+              --show-error \
+              --location \
+              --connect-timeout 15 \
+              --max-time 30 \
+              --output /tmp/ghes-meta-unauthenticated.json \
+              --write-out "%{http_code}" \
+              "https://${GH_HOST}/api/v3/meta"
+          )
+
+          echo "HTTP status: ${HTTP_STATUS}"
+
+          if [[ "${HTTP_STATUS}" -lt 200 || "${HTTP_STATUS}" -ge 500 ]]
+          then
+            echo "::error::Unable to reach the GHES REST API."
+            echo "::error::URL: https://${GH_HOST}/api/v3/meta"
+            exit 1
+          fi
+
+          echo "GHES REST API is reachable."
+
+      # ============================================================
+      # 4. Authenticate GitHub CLI
+      # ============================================================
+
+      - name: Authenticate GitHub CLI against GHES
+        shell: bash
+        env:
+          GHES_AUDIT_TOKEN: ${{ secrets.GHES_AUDIT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GHES_AUDIT_TOKEN:-}" ]]
+          then
+            echo "::error::Secret GHES_AUDIT_TOKEN is not configured."
+            exit 1
+          fi
+
+          # Prevent gh from taking credentials implicitly from the
+          # workflow environment.
+          unset GH_TOKEN || true
+          unset GITHUB_TOKEN || true
+          unset GH_ENTERPRISE_TOKEN || true
+
+          printf '%s' "${GHES_AUDIT_TOKEN}" |
+            gh auth login \
+              --hostname "${GH_HOST}" \
+              --git-protocol https \
+              --with-token
+
+          gh auth status \
+            --hostname "${GH_HOST}"
+
+      # ============================================================
+      # 5. Initialize evidence directories
+      # ============================================================
+
+      - name: Initialize evidence directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${EVIDENCE_DIR}/instance"
+          mkdir -p "${EVIDENCE_DIR}/organization"
+          mkdir -p "${EVIDENCE_DIR}/repositories/raw"
+          mkdir -p "${EVIDENCE
