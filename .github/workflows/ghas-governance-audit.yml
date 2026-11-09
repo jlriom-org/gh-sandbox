@@ -130,14 +130,14 @@ jobs:
 
           echo "Resolving ${GH_HOST}..."
 
-          if ! getent hosts "${GH_HOST}" >/tmp/ghes-dns.txt
+          if ! getent hosts "${GH_HOST}" >/tmp/ghas-dns.txt
           then
             echo "::error::The GitHub-hosted runner cannot resolve ${GH_HOST}."
             echo "::error::Confirm that GHAS is publicly resolvable and reachable."
             exit 1
           fi
 
-          cat /tmp/ghes-dns.txt
+          cat /tmp/ghas-dns.txt
 
           echo
           echo "Testing the GHAS REST API..."
@@ -149,7 +149,7 @@ jobs:
               --location \
               --connect-timeout 15 \
               --max-time 30 \
-              --output /tmp/ghes-meta-unauthenticated.json \
+              --output /tmp/ghas-meta-unauthenticated.json \
               --write-out "%{http_code}" \
               "https://${GH_HOST}/api/v3/meta"
           )
@@ -221,10 +221,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          cat > /tmp/ghes-api.sh <<'BASH'
+          cat > /tmp/ghas-api.sh <<'BASH'
           #!/usr/bin/env bash
 
-          ghes_api_get() {
+          ghas_api_get() {
             local endpoint="$1"
             local output_file="$2"
             local error_file="$3"
@@ -337,7 +337,7 @@ jobs:
           }
           BASH
 
-          chmod +x /tmp/ghes-api.sh
+          chmod +x /tmp/ghas-api.sh
 
       # ============================================================
       # 7. Detect GHAS version
@@ -348,11 +348,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          source /tmp/ghes-api.sh
+          source /tmp/ghas-api.sh
 
           INSTANCE_ERROR="${EVIDENCE_DIR}/errors/instance.log"
 
-          if ! ghes_api_get \
+          if ! ghas_api_get \
             "/meta" \
             "${EVIDENCE_DIR}/instance/meta.json" \
             "${INSTANCE_ERROR}"
@@ -399,12 +399,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          source /tmp/ghes-api.sh
+          source /tmp/ghas-api.sh
 
           IDENTITY_ERROR="${EVIDENCE_DIR}/errors/identity.log"
           ORGANIZATION_ERROR="${EVIDENCE_DIR}/errors/organization.log"
 
-          if ! ghes_api_get \
+          if ! ghas_api_get \
             "/user" \
             "${EVIDENCE_DIR}/organization/audit-user.json" \
             "${IDENTITY_ERROR}"
@@ -427,7 +427,7 @@ jobs:
           echo "AUDIT_USER=${AUDIT_USER}" \
             >> "${GITHUB_ENV}"
 
-          if ! ghes_api_get \
+          if ! ghas_api_get \
             "/orgs/${ORG}" \
             "${EVIDENCE_DIR}/organization/organization.json" \
             "${ORGANIZATION_ERROR}"
@@ -462,7 +462,7 @@ jobs:
           jq -n \
             --arg product "GitHub Enterprise Server" \
             --arg github_hostname "${GH_HOST}" \
-            --arg ghes_version "${GHAS_VERSION}" \
+            --arg ghas_version "${GHAS_VERSION}" \
             --arg organization "${ORG}" \
             --arg authenticated_user "${AUDIT_USER}" \
             --arg generated_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
@@ -473,7 +473,7 @@ jobs:
             '{
               product: $product,
               github_hostname: $github_hostname,
-              ghes_version: $ghes_version,
+              ghas_version: $ghas_version,
               organization: $organization,
               authenticated_user: $authenticated_user,
               generated_at: $generated_at,
@@ -493,7 +493,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          source /tmp/ghes-api.sh
+          source /tmp/ghas-api.sh
 
           CODE_SCANNING_API=false
           SECRET_SCANNING_API=false
@@ -503,7 +503,7 @@ jobs:
           SECRET_SCANNING_ERROR="${EVIDENCE_DIR}/errors/secret-scanning-probe.log"
           CODE_SECURITY_CONFIG_ERROR="${EVIDENCE_DIR}/errors/code-security-configurations.log"
 
-          if ghes_api_get \
+          if ghas_api_get \
             "/orgs/${ORG}/code-scanning/alerts?per_page=1" \
             "${EVIDENCE_DIR}/organization/code-scanning-probe.json" \
             "${CODE_SCANNING_ERROR}"
@@ -514,7 +514,7 @@ jobs:
               > "${EVIDENCE_DIR}/organization/code-scanning-probe.json"
           fi
 
-          if ghes_api_get \
+          if ghas_api_get \
             "/orgs/${ORG}/secret-scanning/alerts?per_page=1" \
             "${EVIDENCE_DIR}/organization/secret-scanning-probe.json" \
             "${SECRET_SCANNING_ERROR}"
@@ -525,7 +525,7 @@ jobs:
               > "${EVIDENCE_DIR}/organization/secret-scanning-probe.json"
           fi
 
-          if ghes_api_get \
+          if ghas_api_get \
             "/orgs/${ORG}/code-security/configurations?per_page=100" \
             "${EVIDENCE_DIR}/organization/code-security-configurations.json" \
             "${CODE_SECURITY_CONFIG_ERROR}"
@@ -611,11 +611,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          source /tmp/ghes-api.sh
+          source /tmp/ghas-api.sh
 
           OWNERS_ERROR="${EVIDENCE_DIR}/errors/organization-owners.log"
 
-          if ghes_api_get \
+          if ghas_api_get \
             "/orgs/${ORG}/members?role=admin&per_page=100" \
             "${EVIDENCE_DIR}/security-officers/owners-pages.json" \
             "${OWNERS_ERROR}" \
@@ -650,12 +650,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          source /tmp/ghes-api.sh
+          source /tmp/ghas-api.sh
 
           SECURITY_MANAGER_ERROR="${EVIDENCE_DIR}/errors/security-managers.log"
           SECURITY_MANAGER_API=false
 
-          if ghes_api_get \
+          if ghas_api_get \
             "/orgs/${ORG}/security-managers" \
             "${EVIDENCE_DIR}/security-officers/security-managers-response.json" \
             "${SECURITY_MANAGER_ERROR}"
@@ -700,7 +700,7 @@ jobs:
             TEAM_MEMBERS="/tmp/${SAFE_TEAM}-members.json"
             TEAM_ENRICHED="/tmp/${SAFE_TEAM}-members-enriched.json"
 
-            if ghes_api_get \
+            if ghas_api_get \
               "/orgs/${ORG}/teams/${TEAM_SLUG}/members?per_page=100" \
               "${TEAM_PAGES}" \
               "${TEAM_ERROR}" \
@@ -768,11 +768,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          source /tmp/ghes-api.sh
+          source /tmp/ghas-api.sh
 
           REPOSITORIES_ERROR="${EVIDENCE_DIR}/errors/repository-inventory.log"
 
-          if ! ghes_api_get \
+          if ! ghas_api_get \
             "/orgs/${ORG}/repos?type=all&per_page=100" \
             "${EVIDENCE_DIR}/repositories/repository-pages.json" \
             "${REPOSITORIES_ERROR}" \
@@ -802,7 +802,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          source /tmp/ghes-api.sh
+          source /tmp/ghas-api.sh
 
           echo '[]' \
             > "${EVIDENCE_DIR}/repositories/repository-security.json"
@@ -822,7 +822,7 @@ jobs:
 
             echo "Inspecting ${ORG}/${REPOSITORY}"
 
-            if ghes_api_get \
+            if ghas_api_get \
               "/repos/${ORG}/${REPOSITORY}" \
               "${REPOSITORY_FILE}" \
               "${REPOSITORY_ERROR}"
@@ -1226,7 +1226,7 @@ jobs:
           summary = {
               "product": "GitHub Enterprise Server",
               "github_hostname": os.environ["GH_HOST"],
-              "ghes_version": os.environ.get(
+              "ghas_version": os.environ.get(
                   "GHAS_VERSION",
                   "unknown"
               ),
@@ -1396,7 +1396,7 @@ jobs:
               f"{summary['github_hostname']}",
               "",
               f"**GHAS version:** "
-              f"{summary['ghes_version']}",
+              f"{summary['ghas_version']}",
               "",
               f"**Organization:** "
               f"{summary['organization']}",
