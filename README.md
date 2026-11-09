@@ -1,5 +1,6 @@
 # gh-sandbox
 
+
 ## Prevent new vulnerabilities
 
 Como experto en GitHub Actions y GHAS,
@@ -135,13 +136,12 @@ Active
 
 Supongamos que master contiene estas alertas:
 
-| Alerta | Estado en master | Modificada por el PR | Resultado |
-| ---- | ---- | ---- | ---- |
-| SQL Injection A | Existente | No | No bloquea |
-| XSS B | Existente | No | No bloquea |
-| Path Traversal C | Nueva |	Sí	Bloquea |
-| SQL Injection A | Existente |	El PR modifica la zona vulnerable |	Puede bloquear |
-
+| Alerta           | Estado en master | Modificada por el PR              | Resultado      |
+| ---------------- | ---------------- | --------------------------------- | -------------- |
+| SQL Injection A  | Existente        | No                                | No bloquea     |
+| XSS B            | Existente        | No                                | No bloquea     |
+| Path Traversal C | Nueva            | Sí	Bloquea                       |                |
+| SQL Injection A  | Existente        | El PR modifica la zona vulnerable | Puede bloquear |
 
 La última situación es importante. Si el Pull Request modifica las líneas asociadas a una vulnerabilidad histórica, CodeQL puede considerarla relevante para el PR. No debe utilizarse el concepto de línea base para permitir que un cambio mantenga o vuelva a introducir código vulnerable dentro del área modificada.
 
@@ -218,7 +218,6 @@ Do not allow bypassing the above settings
 
 si se utiliza branch protection clásica, o no incorporar administradores generales a la bypass list del Ruleset.
 
-
 ### Prueba de aceptación
 
 ** Caso positivo **
@@ -233,7 +232,7 @@ si se utiliza branch protection clásica, o no incorporar administradores genera
 
 Introducir temporalmente un patrón inseguro controlado, por ejemplo en JavaScript:
 
-``` Javascript
+```Javascript
 
 const express = require("express");
 const cp = require("child_process");
@@ -262,6 +261,7 @@ detectado en el PR
 Merge:
 bloqueado por el Ruleset
 ```
+
 Eliminar el código vulnerable después de validar el comportamiento.
 
 ### Política recomendada
