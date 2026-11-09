@@ -2,6 +2,7 @@
 
 ## Prevent new vulnerabilities
 
+
 Como experto en GitHub Actions y GHAS,
 Crea un procedimiento WorkFlow GitHub Action que impida introducir vulnerabilidad en la rama destino, por ejemplo master, sin bloquear las que ya existen en la rama de master
 
