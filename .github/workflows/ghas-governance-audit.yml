@@ -1,15 +1,15 @@
-name: GHES GHAS Organization Governance Audit
+name: GHAS Organization Governance Audit
 
 on:
   workflow_dispatch:
     inputs:
       organization:
-        description: "GHES organization to audit"
+        description: "GHAS organization to audit"
         required: true
         type: string
 
       github_hostname:
-        description: "GHES hostname without https://"
+        description: "GHAS hostname without https://"
         required: true
         type: string
 
@@ -116,14 +116,14 @@ jobs:
             exit 1
           fi
 
-          echo "GHES hostname: ${GH_HOST}"
+          echo "GHAS hostname: ${GH_HOST}"
           echo "Organization: ${ORG}"
 
       # ============================================================
-      # 3. Test GHES connectivity
+      # 3. Test GHAS connectivity
       # ============================================================
 
-      - name: Test GHES connectivity
+      - name: Test GHAS connectivity
         shell: bash
         run: |
           set -euo pipefail
@@ -133,14 +133,14 @@ jobs:
           if ! getent hosts "${GH_HOST}" >/tmp/ghes-dns.txt
           then
             echo "::error::The GitHub-hosted runner cannot resolve ${GH_HOST}."
-            echo "::error::Confirm that GHES is publicly resolvable and reachable."
+            echo "::error::Confirm that GHAS is publicly resolvable and reachable."
             exit 1
           fi
 
           cat /tmp/ghes-dns.txt
 
           echo
-          echo "Testing the GHES REST API..."
+          echo "Testing the GHAS REST API..."
 
           HTTP_STATUS=$(
             curl \
@@ -158,27 +158,27 @@ jobs:
 
           if [[ "${HTTP_STATUS}" -lt 200 || "${HTTP_STATUS}" -ge 500 ]]
           then
-            echo "::error::Unable to reach the GHES REST API."
+            echo "::error::Unable to reach the GHAS REST API."
             echo "::error::URL: https://${GH_HOST}/api/v3/meta"
             exit 1
           fi
 
-          echo "GHES REST API is reachable."
+          echo "GHAS REST API is reachable."
 
       # ============================================================
       # 4. Authenticate GitHub CLI
       # ============================================================
 
-      - name: Authenticate GitHub CLI against GHES
+      - name: Authenticate GitHub CLI against GHAS
         shell: bash
         env:
-          GHES_AUDIT_TOKEN: ${{ secrets.GHES_AUDIT_TOKEN }}
+          GHAS_AUDIT_TOKEN: ${{ secrets.GHAS_AUDIT_TOKEN }}
         run: |
           set -euo pipefail
 
-          if [[ -z "${GHES_AUDIT_TOKEN:-}" ]]
+          if [[ -z "${GHAS_AUDIT_TOKEN:-}" ]]
           then
-            echo "::error::Secret GHES_AUDIT_TOKEN is not configured."
+            echo "::error::Secret GHAS_AUDIT_TOKEN is not configured."
             exit 1
           fi
 
@@ -188,7 +188,7 @@ jobs:
           unset GITHUB_TOKEN || true
           unset GH_ENTERPRISE_TOKEN || true
 
-          printf '%s' "${GHES_AUDIT_TOKEN}" |
+          printf '%s' "${GHAS_AUDIT_TOKEN}" |
             gh auth login \
               --hostname "${GH_HOST}" \
               --git-protocol https \
@@ -213,10 +213,10 @@ jobs:
           mkdir -p "${EVIDENCE_DIR}/errors"
 
       # ============================================================
-      # 6. Create reusable GHES API helper
+      # 6. Create reusable GHAS API helper
       # ============================================================
 
-      - name: Create GHES API helper
+      - name: Create GHAS API helper
         shell: bash
         run: |
           set -euo pipefail
@@ -340,10 +340,10 @@ jobs:
           chmod +x /tmp/ghes-api.sh
 
       # ============================================================
-      # 7. Detect GHES version
+      # 7. Detect GHAS version
       # ============================================================
 
-      - name: Detect GHES version
+      - name: Detect GHAS version
         shell: bash
         run: |
           set -euo pipefail
@@ -357,11 +357,11 @@ jobs:
             "${EVIDENCE_DIR}/instance/meta.json" \
             "${INSTANCE_ERROR}"
           then
-            echo "::error::Unable to retrieve GHES metadata."
+            echo "::error::Unable to retrieve GHAS metadata."
             exit 1
           fi
 
-          GHES_VERSION=$(
+          GHAS_VERSION=$(
             gh api \
               --hostname "${GH_HOST}" \
               --include \
@@ -380,15 +380,15 @@ jobs:
             '
           )
 
-          if [[ -z "${GHES_VERSION}" ]]
+          if [[ -z "${GHAS_VERSION}" ]]
           then
-            GHES_VERSION="unknown"
+            GHAS_VERSION="unknown"
           fi
 
-          echo "GHES_VERSION=${GHES_VERSION}" \
+          echo "GHAS_VERSION=${GHAS_VERSION}" \
             >> "${GITHUB_ENV}"
 
-          echo "GHES version: ${GHES_VERSION}"
+          echo "GHAS version: ${GHAS_VERSION}"
 
       # ============================================================
       # 8. Validate identity and organization
@@ -462,7 +462,7 @@ jobs:
           jq -n \
             --arg product "GitHub Enterprise Server" \
             --arg github_hostname "${GH_HOST}" \
-            --arg ghes_version "${GHES_VERSION}" \
+            --arg ghes_version "${GHAS_VERSION}" \
             --arg organization "${ORG}" \
             --arg authenticated_user "${AUDIT_USER}" \
             --arg generated_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
@@ -1098,7 +1098,7 @@ jobs:
                       )
                   elif gap == "advanced_security_not_confirmed":
                       recommended_action = (
-                          "Validate GHES version, token permissions "
+                          "Validate GHAS version, token permissions "
                           "and the repository security_and_analysis response."
                       )
                   elif gap == "secret_scanning_disabled":
@@ -1227,7 +1227,7 @@ jobs:
               "product": "GitHub Enterprise Server",
               "github_hostname": os.environ["GH_HOST"],
               "ghes_version": os.environ.get(
-                  "GHES_VERSION",
+                  "GHAS_VERSION",
                   "unknown"
               ),
               "organization": os.environ["ORG"],
@@ -1395,7 +1395,7 @@ jobs:
               f"**GitHub Enterprise Server:** "
               f"{summary['github_hostname']}",
               "",
-              f"**GHES version:** "
+              f"**GHAS version:** "
               f"{summary['ghes_version']}",
               "",
               f"**Organization:** "
