@@ -17,8 +17,15 @@ const cp = require("child_process");
 
 const app = express();
 
+
+
 app.get("/execute", (req, res) => {
+    // This is a comment
+
   cp.exec(req.query.command, (error, stdout) => {
     res.send(stdout);
   });
+
+    // This is a comment at the end of the function
+
 });
