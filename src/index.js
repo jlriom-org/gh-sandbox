@@ -30,21 +30,23 @@ app.get("/execute", (req, res) => {
 
 });
 
-const _ = require("lodash");
 
-function mergeUserPreferences(userPreferences) {
-    const defaults = {
-        theme: "light",
-        language: "en",
-        notifications: true
-    };
+const { exec } = require("node:child_process");
 
-    return _.defaultsDeep({}, userPreferences, defaults);
+/**
+ * INTENTIONALLY VULNERABLE.
+ * Use only in an isolated security-testing repository.
+ */
+function checkHost(hostname) {
+    return new Promise((resolve, reject) => {
+        // User-controlled input is concatenated into a shell command.
+        exec(`ping -c 1 ${hostname}`, (error, stdout, stderr) => {
+            if (error) {
+                reject(new Error(stderr || error.message));
+                return;
+            }
+
+            resolve(stdout);
+        });
+    });
 }
-
-// Normal application usage
-const preferences = mergeUserPreferences({
-    theme: "dark"
-});
-
-console.log("User preferences:", preferences);
