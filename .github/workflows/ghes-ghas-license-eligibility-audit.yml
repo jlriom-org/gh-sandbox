@@ -1,0 +1,1663 @@
+name: GHES GHAS License and Eligibility Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      enterprise:
+        description: "Enterprise account slug"
+        required: true
+        type: string
+
+      github_hostname:
+        description: "GHES hostname without https://"
+        required: true
+        type: string
+
+      organizations:
+        description: >-
+          Optional comma-separated organization slugs.
+          Leave empty to discover organizations from the Enterprise.
+        required: false
+        default: ""
+        type: string
+
+      runner_label:
+        description: "Label of the self-hosted runner"
+        required: false
+        default: "ghes"
+        type: string
+
+      include_archived:
+        description: "Include archived repositories"
+        required: false
+        default: false
+        type: boolean
+
+      include_forks:
+        description: "Include fork repositories"
+        required: false
+        default: false
+        type: boolean
+
+      private_repositories_only:
+        description: "Limit eligibility analysis to private/internal repositories"
+        required: false
+        default: true
+        type: boolean
+
+      fail_on_gaps:
+        description: "Fail when critical governance gaps are detected"
+        required: false
+        default: false
+        type: boolean
+
+      insecure_tls:
+        description: "Disable TLS verification, diagnostic use only"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  audit-ghas-governance:
+    name: Confirm license, eligible repositories and security officers
+
+    runs-on:
+      - self-hosted
+      - ${{ inputs.runner_label }}
+
+    timeout-minutes: 180
+
+    env:
+      GH_HOST: ${{ inputs.github_hostname }}
+      ENTERPRISE: ${{ inputs.enterprise }}
+      REQUESTED_ORGANIZATIONS: ${{ inputs.organizations }}
+      INCLUDE_ARCHIVED: ${{ inputs.include_archived }}
+      INCLUDE_FORKS: ${{ inputs.include_forks }}
+      PRIVATE_ONLY: ${{ inputs.private_repositories_only }}
+      FAIL_ON_GAPS: ${{ inputs.fail_on_gaps }}
+      INSECURE_TLS: ${{ inputs.insecure_tls }}
+      API_VERSION: "2022-11-28"
+      EVIDENCE_DIR: "ghes-ghas-governance-evidence"
+
+    steps:
+      # =============================================================
+      # 1. Validate the self-hosted runner
+      # =============================================================
+
+      - name: Validate self-hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUIRED_COMMANDS=(
+            gh
+            jq
+            curl
+            python3
+            tar
+            sha256sum
+          )
+
+          for COMMAND_NAME in "${REQUIRED_COMMANDS[@]}"
+          do
+            if ! command -v "${COMMAND_NAME}" >/dev/null 2>&1; then
+              echo "::error::Required command not found: ${COMMAND_NAME}"
+              exit 1
+            fi
+          done
+
+          if [[ "${GH_HOST}" == http://* || "${GH_HOST}" == https://* ]]; then
+            echo "::error::github_hostname must not include a URL scheme."
+            exit 1
+          fi
+
+          if [[ "${GH_HOST}" == */* ]]; then
+            echo "::error::github_hostname must contain only the GHES hostname."
+            exit 1
+          fi
+
+          if [[ -z "${ENTERPRISE}" ]]; then
+            echo "::error::enterprise cannot be empty."
+            exit 1
+          fi
+
+          echo "GitHub CLI:"
+          gh --version
+
+          echo
+          echo "jq:"
+          jq --version
+
+          echo
+          echo "Python:"
+          python3 --version
+
+      # =============================================================
+      # 2. Configure TLS
+      # =============================================================
+
+      - name: Configure GHES TLS behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${INSECURE_TLS}" == "true" ]]; then
+            echo "::warning::TLS verification has been disabled."
+            echo "GHES_SKIP_TLS_VERIFY=true" >> "${GITHUB_ENV}"
+          else
+            echo "TLS certificate verification is enabled."
+          fi
+
+      # =============================================================
+      # 3. Check connectivity
+      # =============================================================
+
+      - name: Check GHES connectivity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURL_OPTIONS=(
+            --silent
+            --show-error
+            --location
+            --connect-timeout 15
+            --max-time 60
+          )
+
+          if [[ "${INSECURE_TLS}" == "true" ]]; then
+            CURL_OPTIONS+=(--insecure)
+          fi
+
+          HTTP_STATUS=$(
+            curl \
+              "${CURL_OPTIONS[@]}" \
+              --output /tmp/ghes-meta.json \
+              --write-out "%{http_code}" \
+              "https://${GH_HOST}/api/v3/meta"
+          )
+
+          if [[ "${HTTP_STATUS}" -lt 200 || "${HTTP_STATUS}" -ge 500 ]]; then
+            echo "::error::Unable to reach https://${GH_HOST}/api/v3/meta"
+            echo "::error::HTTP status: ${HTTP_STATUS}"
+            exit 1
+          fi
+
+          echo "GHES API is reachable."
+
+      # =============================================================
+      # 4. Authenticate GitHub CLI
+      # =============================================================
+
+      - name: Login to GHES
+        shell: bash
+        env:
+          GHES_AUDIT_TOKEN: ${{ secrets.GHES_AUDIT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GHES_AUDIT_TOKEN:-}" ]]; then
+            echo "::error::Secret GHES_AUDIT_TOKEN is not configured."
+            exit 1
+          fi
+
+          unset GH_TOKEN || true
+          unset GITHUB_TOKEN || true
+          unset GH_ENTERPRISE_TOKEN || true
+
+          gh auth logout \
+            --hostname "${GH_HOST}" \
+            2>/dev/null || true
+
+          printf '%s' "${GHES_AUDIT_TOKEN}" |
+            gh auth login \
+              --hostname "${GH_HOST}" \
+              --git-protocol https \
+              --with-token
+
+          gh auth status --hostname "${GH_HOST}"
+
+      # =============================================================
+      # 5. Initialize evidence directories
+      # =============================================================
+
+      - name: Initialize evidence package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${EVIDENCE_DIR}/instance"
+          mkdir -p "${EVIDENCE_DIR}/enterprise"
+          mkdir -p "${EVIDENCE_DIR}/organizations"
+          mkdir -p "${EVIDENCE_DIR}/repositories"
+          mkdir -p "${EVIDENCE_DIR}/security-officers"
+          mkdir -p "${EVIDENCE_DIR}/errors"
+          mkdir -p "${EVIDENCE_DIR}/raw"
+
+      # =============================================================
+      # 6. Create reusable GHES API helper
+      # =============================================================
+
+      - name: Create GHES API helper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/ghes-api.sh <<'BASH'
+          #!/usr/bin/env bash
+
+          ghes_api_get() {
+            local endpoint="$1"
+            local output_file="$2"
+            local error_file="$3"
+            local paginated="${4:-false}"
+
+            mkdir -p "$(dirname "${output_file}")"
+            mkdir -p "$(dirname "${error_file}")"
+
+            local temporary_error
+            temporary_error=$(mktemp)
+
+            local command=(
+              gh api
+              --hostname "${GH_HOST}"
+              -H "Accept: application/vnd.github+json"
+            )
+
+            if [[ -n "${API_VERSION:-}" ]]; then
+              command+=(
+                -H "X-GitHub-Api-Version: ${API_VERSION}"
+              )
+            fi
+
+            if [[ "${paginated}" == "true" ]]; then
+              command+=(--paginate --slurp)
+            fi
+
+            command+=("${endpoint}")
+
+            set +e
+            "${command[@]}" \
+              > "${output_file}" \
+              2> "${temporary_error}"
+            local exit_code=$?
+            set -e
+
+            if [[ "${exit_code}" -eq 0 ]]; then
+              rm -f "${temporary_error}"
+              return 0
+            fi
+
+            {
+              echo "Endpoint: ${endpoint}"
+              echo "Exit code: ${exit_code}"
+              cat "${temporary_error}"
+              echo
+            } >> "${error_file}"
+
+            rm -f "${temporary_error}"
+            return "${exit_code}"
+          }
+
+          flatten_pages() {
+            local input_file="$1"
+            local output_file="$2"
+
+            jq '
+              if type == "array" then
+                [
+                  .[]
+                  | if type == "array"
+                    then .[]
+                    else .
+                    end
+                ]
+              else
+                []
+              end
+            ' "${input_file}" > "${output_file}"
+          }
+
+          normalize_array_response() {
+            local input_file="$1"
+            local array_property="$2"
+            local output_file="$3"
+
+            jq \
+              --arg property "${array_property}" \
+              '
+                if type == "array" then
+                  [
+                    .[]
+                    | if type == "array" then
+                        .[]
+                      elif type == "object" and has($property) then
+                        .[$property][]
+                      else
+                        .
+                      end
+                  ]
+                elif type == "object" and has($property) then
+                  .[$property]
+                else
+                  []
+                end
+              ' \
+              "${input_file}" \
+              > "${output_file}"
+          }
+          BASH
+
+          chmod +x /tmp/ghes-api.sh
+
+      # =============================================================
+      # 7. Detect GHES version and authenticated identity
+      # =============================================================
+
+      - name: Detect GHES instance information
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source /tmp/ghes-api.sh
+
+          ERROR_FILE="${EVIDENCE_DIR}/errors/instance.log"
+
+          ghes_api_get \
+            "/meta" \
+            "${EVIDENCE_DIR}/instance/meta.json" \
+            "${ERROR_FILE}"
+
+          AUTHENTICATED_USER=$(
+            gh api \
+              --hostname "${GH_HOST}" \
+              -H "Accept: application/vnd.github+json" \
+              /user \
+              --jq '.login'
+          )
+
+          GHES_VERSION=$(
+            gh api \
+              --hostname "${GH_HOST}" \
+              --include \
+              /meta \
+            | tr -d '\r' \
+            | awk '
+                BEGIN { IGNORECASE = 1 }
+                /^x-github-enterprise-version:/ {
+                  sub(/^[^:]+:[[:space:]]*/, "", $0)
+                  print $0
+                  exit
+                }
+              '
+          )
+
+          if [[ -z "${GHES_VERSION}" ]]; then
+            GHES_VERSION="unknown"
+          fi
+
+          echo "GHES_VERSION=${GHES_VERSION}" >> "${GITHUB_ENV}"
+          echo "AUDIT_USER=${AUTHENTICATED_USER}" >> "${GITHUB_ENV}"
+
+          cat > "${EVIDENCE_DIR}/metadata.json" <<EOF
+          {
+            "product": "GitHub Enterprise Server",
+            "github_hostname": "${GH_HOST}",
+            "enterprise": "${ENTERPRISE}",
+            "ghes_version": "${GHES_VERSION}",
+            "authenticated_user": "${AUTHENTICATED_USER}",
+            "generated_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "workflow_repository": "${GITHUB_REPOSITORY}",
+            "workflow_run_id": "${GITHUB_RUN_ID}",
+            "workflow_run_number": "${GITHUB_RUN_NUMBER}",
+            "include_archived": ${INCLUDE_ARCHIVED},
+            "include_forks": ${INCLUDE_FORKS},
+            "private_repositories_only": ${PRIVATE_ONLY},
+            "insecure_tls": ${INSECURE_TLS}
+          }
+          EOF
+
+          echo "GHES version: ${GHES_VERSION}"
+          echo "Authenticated identity: ${AUTHENTICATED_USER}"
+
+      # =============================================================
+      # 8. Check token and enterprise administration access
+      # =============================================================
+
+      - name: Confirm enterprise administration access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source /tmp/ghes-api.sh
+
+          ERROR_FILE="${EVIDENCE_DIR}/errors/enterprise-access.log"
+
+          ENTERPRISE_ACCESS=false
+          SITE_ADMIN_VISIBLE=false
+
+          if ghes_api_get \
+            "/enterprises/${ENTERPRISE}" \
+            "${EVIDENCE_DIR}/enterprise/enterprise.json" \
+            "${ERROR_FILE}"
+          then
+            ENTERPRISE_ACCESS=true
+          else
+            echo '{}' > "${EVIDENCE_DIR}/enterprise/enterprise.json"
+          fi
+
+          if ghes_api_get \
+            "/user" \
+            "${EVIDENCE_DIR}/enterprise/audit-user.json" \
+            "${ERROR_FILE}"
+          then
+            SITE_ADMIN_VISIBLE=$(
+              jq -r '
+                if has("site_admin")
+                then .site_admin
+                else false
+                end
+              ' "${EVIDENCE_DIR}/enterprise/audit-user.json"
+            )
+          else
+            echo '{}' > "${EVIDENCE_DIR}/enterprise/audit-user.json"
+          fi
+
+          cat > "${EVIDENCE_DIR}/enterprise/access-assessment.json" <<EOF
+          {
+            "enterprise_endpoint_accessible": ${ENTERPRISE_ACCESS},
+            "authenticated_user_site_admin": ${SITE_ADMIN_VISIBLE}
+          }
+          EOF
+
+          if [[ "${ENTERPRISE_ACCESS}" != "true" ]]; then
+            echo "::warning::Enterprise endpoint cannot be accessed."
+            echo "::warning::Organization input may still allow a partial audit."
+          fi
+
+      # =============================================================
+      # 9. Discover organizations
+      # =============================================================
+
+      - name: Discover Enterprise organizations
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source /tmp/ghes-api.sh
+
+          ERROR_FILE="${EVIDENCE_DIR}/errors/organization-discovery.log"
+          ORGANIZATIONS_FILE="${EVIDENCE_DIR}/enterprise/organizations.json"
+
+          if [[ -n "${REQUESTED_ORGANIZATIONS// /}" ]]; then
+            printf '%s' "${REQUESTED_ORGANIZATIONS}" |
+              tr ',' '\n' |
+              sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
+              sed '/^$/d' |
+              sort -u |
+              jq -R -s '
+                split("\n")
+                | map(select(length > 0))
+                | map({
+                    login: .,
+                    discovery_source: "workflow_input"
+                  })
+              ' > "${ORGANIZATIONS_FILE}"
+
+            echo "Organizations loaded from workflow input."
+          else
+            DISCOVERED=false
+
+            if ghes_api_get \
+              "/enterprises/${ENTERPRISE}/organizations?per_page=100" \
+              "${EVIDENCE_DIR}/raw/enterprise-organization-pages.json" \
+              "${ERROR_FILE}" \
+              true
+            then
+              normalize_array_response \
+                "${EVIDENCE_DIR}/raw/enterprise-organization-pages.json" \
+                "organizations" \
+                "${ORGANIZATIONS_FILE}"
+
+              DISCOVERED=true
+            fi
+
+            if [[ "${DISCOVERED}" != "true" ]]; then
+              echo "::error::Organizations could not be discovered."
+              echo "::error::Provide the organizations input as a comma-separated list."
+              exit 1
+            fi
+          fi
+
+          jq -r '
+            .[]
+            | if type == "string"
+              then .
+              else .login
+              end
+          ' "${ORGANIZATIONS_FILE}" |
+            sed '/^null$/d;/^$/d' |
+            sort -u \
+            > "${EVIDENCE_DIR}/enterprise/organization-list.txt"
+
+          ORGANIZATION_COUNT=$(
+            wc -l \
+              < "${EVIDENCE_DIR}/enterprise/organization-list.txt"
+          )
+
+          echo "Organizations selected: ${ORGANIZATION_COUNT}"
+
+          if [[ "${ORGANIZATION_COUNT}" -eq 0 ]]; then
+            echo "::error::No organizations were selected."
+            exit 1
+          fi
+
+      # =============================================================
+      # 10. Confirm GHAS license and feature availability
+      # =============================================================
+
+      - name: Confirm GHAS license and feature availability
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source /tmp/ghes-api.sh
+
+          ERROR_FILE="${EVIDENCE_DIR}/errors/license-assessment.log"
+
+          LICENSE_ENDPOINT_AVAILABLE=false
+          SECURITY_PRODUCTS_STATS_AVAILABLE=false
+          GHAS_FEATURE_OBSERVED=false
+
+          # Endpoint availability differs between GHES versions.
+          # The workflow records both direct evidence and functional evidence.
+
+          if ghes_api_get \
+            "/enterprise/settings/license" \
+            "${EVIDENCE_DIR}/enterprise/license.json" \
+            "${ERROR_FILE}"
+          then
+            LICENSE_ENDPOINT_AVAILABLE=true
+          else
+            echo '{}' > "${EVIDENCE_DIR}/enterprise/license.json"
+          fi
+
+          if ghes_api_get \
+            "/enterprise/stats/security-products" \
+            "${EVIDENCE_DIR}/enterprise/security-products-statistics.json" \
+            "${ERROR_FILE}"
+          then
+            SECURITY_PRODUCTS_STATS_AVAILABLE=true
+          else
+            echo '{}' \
+              > "${EVIDENCE_DIR}/enterprise/security-products-statistics.json"
+          fi
+
+          while IFS= read -r ORG
+          do
+            if ghes_api_get \
+              "/orgs/${ORG}/code-scanning/alerts?per_page=1" \
+              "/tmp/${ORG}-code-scanning-probe.json" \
+              "${ERROR_FILE}"
+            then
+              GHAS_FEATURE_OBSERVED=true
+              break
+            fi
+
+            if ghes_api_get \
+              "/orgs/${ORG}/secret-scanning/alerts?per_page=1" \
+              "/tmp/${ORG}-secret-scanning-probe.json" \
+              "${ERROR_FILE}"
+            then
+              GHAS_FEATURE_OBSERVED=true
+              break
+            fi
+          done < "${EVIDENCE_DIR}/enterprise/organization-list.txt"
+
+          LICENSE_TERMS_FOUND=false
+
+          if jq -e '
+            [
+              paths(scalars) as $path
+              | {
+                  path: ($path | map(tostring) | join(".")),
+                  value: getpath($path)
+                }
+              | select(
+                  (
+                    .path
+                    + " "
+                    + (.value | tostring)
+                  )
+                  | test(
+                      "advanced.security|github.advanced.security|ghas|secret.scanning|code.scanning";
+                      "i"
+                    )
+                )
+            ]
+            | length > 0
+          ' "${EVIDENCE_DIR}/enterprise/license.json" >/dev/null 2>&1
+          then
+            LICENSE_TERMS_FOUND=true
+          fi
+
+          if [[ "${LICENSE_TERMS_FOUND}" == "true" ]]; then
+            LICENSE_STATUS="confirmed_by_license_endpoint"
+          elif [[ "${GHAS_FEATURE_OBSERVED}" == "true" ]]; then
+            LICENSE_STATUS="functionally_observed"
+          elif [[ "${LICENSE_ENDPOINT_AVAILABLE}" == "true" ]]; then
+            LICENSE_STATUS="not_identified_in_license_response"
+          else
+            LICENSE_STATUS="requires_administrative_confirmation"
+          fi
+
+          cat > "${EVIDENCE_DIR}/enterprise/license-assessment.json" <<EOF
+          {
+            "status": "${LICENSE_STATUS}",
+            "license_endpoint_available": ${LICENSE_ENDPOINT_AVAILABLE},
+            "ghas_terms_found_in_license_response": ${LICENSE_TERMS_FOUND},
+            "security_products_statistics_available": ${SECURITY_PRODUCTS_STATS_AVAILABLE},
+            "ghas_feature_functionally_observed": ${GHAS_FEATURE_OBSERVED},
+            "interpretation": "A functional observation confirms availability of at least one GHAS API but is not authoritative evidence of purchased seat count."
+          }
+          EOF
+
+          echo "GHAS license assessment: ${LICENSE_STATUS}"
+
+      # =============================================================
+      # 11. Collect organizations, security managers and repositories
+      # =============================================================
+
+      - name: Collect organization governance evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source /tmp/ghes-api.sh
+
+          while IFS= read -r ORG
+          do
+            echo "::group::Organization ${ORG}"
+
+            SAFE_ORG=$(
+              printf '%s' "${ORG}" |
+                sed 's/[^a-zA-Z0-9._-]/_/g'
+            )
+
+            ORG_DIR="${EVIDENCE_DIR}/organizations/${SAFE_ORG}"
+            OFFICER_DIR="${EVIDENCE_DIR}/security-officers/${SAFE_ORG}"
+            REPO_DIR="${EVIDENCE_DIR}/repositories/${SAFE_ORG}"
+            ERROR_FILE="${EVIDENCE_DIR}/errors/${SAFE_ORG}.log"
+
+            mkdir -p "${ORG_DIR}" "${OFFICER_DIR}" "${REPO_DIR}"
+            touch "${ERROR_FILE}"
+
+            if ! ghes_api_get \
+              "/orgs/${ORG}" \
+              "${ORG_DIR}/organization.json" \
+              "${ERROR_FILE}"
+            then
+              echo '{}' > "${ORG_DIR}/organization.json"
+            fi
+
+            # Organization owners
+            if ghes_api_get \
+              "/orgs/${ORG}/members?role=admin&per_page=100" \
+              "${OFFICER_DIR}/owners-pages.json" \
+              "${ERROR_FILE}" \
+              true
+            then
+              flatten_pages \
+                "${OFFICER_DIR}/owners-pages.json" \
+                "${OFFICER_DIR}/owners.json"
+            else
+              echo '[]' > "${OFFICER_DIR}/owners.json"
+            fi
+
+            # Dedicated security managers.
+            # Availability depends on the installed GHES version.
+            if ghes_api_get \
+              "/orgs/${ORG}/security-managers" \
+              "${OFFICER_DIR}/security-managers-response.json" \
+              "${ERROR_FILE}"
+            then
+              jq '
+                if type == "array" then
+                  .
+                elif type == "object" and has("teams") then
+                  .teams
+                elif type == "object" and has("security_managers") then
+                  .security_managers
+                else
+                  [.]
+                end
+              ' "${OFFICER_DIR}/security-managers-response.json" \
+                > "${OFFICER_DIR}/security-manager-teams.json"
+            else
+              echo '[]' \
+                > "${OFFICER_DIR}/security-manager-teams.json"
+            fi
+
+            echo '[]' > "${OFFICER_DIR}/security-manager-members.json"
+
+            jq -r '
+              .[]
+              | select(type == "object")
+              | .slug // empty
+            ' "${OFFICER_DIR}/security-manager-teams.json" |
+            while IFS= read -r TEAM_SLUG
+            do
+              SAFE_TEAM=$(
+                printf '%s' "${TEAM_SLUG}" |
+                  sed 's/[^a-zA-Z0-9._-]/_/g'
+              )
+
+              if ghes_api_get \
+                "/orgs/${ORG}/teams/${TEAM_SLUG}/members?per_page=100" \
+                "${OFFICER_DIR}/${SAFE_TEAM}-members-pages.json" \
+                "${ERROR_FILE}" \
+                true
+              then
+                flatten_pages \
+                  "${OFFICER_DIR}/${SAFE_TEAM}-members-pages.json" \
+                  "${OFFICER_DIR}/${SAFE_TEAM}-members.json"
+
+                jq \
+                  --arg team "${TEAM_SLUG}" \
+                  --arg org "${ORG}" \
+                  '
+                    map(
+                      . + {
+                        organization: $org,
+                        security_manager_team: $team
+                      }
+                    )
+                  ' "${OFFICER_DIR}/${SAFE_TEAM}-members.json" \
+                    > "${OFFICER_DIR}/${SAFE_TEAM}-members-enriched.json"
+
+                jq -s 'add' \
+                  "${OFFICER_DIR}/security-manager-members.json" \
+                  "${OFFICER_DIR}/${SAFE_TEAM}-members-enriched.json" \
+                  > "${OFFICER_DIR}/security-manager-members.tmp.json"
+
+                mv \
+                  "${OFFICER_DIR}/security-manager-members.tmp.json" \
+                  "${OFFICER_DIR}/security-manager-members.json"
+              fi
+            done
+
+            # Repository inventory
+            if ghes_api_get \
+              "/orgs/${ORG}/repos?type=all&per_page=100" \
+              "${REPO_DIR}/repository-pages.json" \
+              "${ERROR_FILE}" \
+              true
+            then
+              flatten_pages \
+                "${REPO_DIR}/repository-pages.json" \
+                "${REPO_DIR}/repositories.json"
+            else
+              echo '[]' > "${REPO_DIR}/repositories.json"
+            fi
+
+            # Retrieve complete security_and_analysis information per repo.
+            echo '[]' > "${REPO_DIR}/repository-security.json"
+
+            jq -r '.[].name' "${REPO_DIR}/repositories.json" |
+            while IFS= read -r REPOSITORY
+            do
+              SAFE_REPOSITORY=$(
+                printf '%s' "${REPOSITORY}" |
+                  sed 's/[^a-zA-Z0-9._-]/_/g'
+              )
+
+              if ghes_api_get \
+                "/repos/${ORG}/${REPOSITORY}" \
+                "${REPO_DIR}/${SAFE_REPOSITORY}.json" \
+                "${ERROR_FILE}"
+              then
+                jq -s '.[0] + [.[1]]' \
+                  "${REPO_DIR}/repository-security.json" \
+                  "${REPO_DIR}/${SAFE_REPOSITORY}.json" \
+                  > "${REPO_DIR}/repository-security.tmp.json"
+
+                mv \
+                  "${REPO_DIR}/repository-security.tmp.json" \
+                  "${REPO_DIR}/repository-security.json"
+              fi
+            done
+
+            echo "::endgroup::"
+          done < "${EVIDENCE_DIR}/enterprise/organization-list.txt"
+
+      # =============================================================
+      # 12. Normalize reports
+      # =============================================================
+
+      - name: Generate license, eligibility and officer reports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PYTHON'
+          import csv
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = Path(os.environ["EVIDENCE_DIR"])
+
+          include_archived = (
+              os.environ["INCLUDE_ARCHIVED"].lower() == "true"
+          )
+          include_forks = (
+              os.environ["INCLUDE_FORKS"].lower() == "true"
+          )
+          private_only = (
+              os.environ["PRIVATE_ONLY"].lower() == "true"
+          )
+
+          def load_json(path, default):
+              try:
+                  with Path(path).open(
+                      "r",
+                      encoding="utf-8"
+                  ) as stream:
+                      return json.load(stream)
+              except (
+                  FileNotFoundError,
+                  json.JSONDecodeError,
+                  PermissionError
+              ):
+                  return default
+
+          def nested(data, *keys, default=None):
+              value = data
+
+              for key in keys:
+                  if not isinstance(value, dict):
+                      return default
+
+                  value = value.get(key)
+
+                  if value is None:
+                      return default
+
+              return value
+
+          def write_csv(path, rows, fieldnames=None):
+              path = Path(path)
+
+              if fieldnames is None:
+                  fieldnames = list(rows[0].keys()) if rows else []
+
+              with path.open(
+                  "w",
+                  encoding="utf-8",
+                  newline=""
+              ) as stream:
+                  if not fieldnames:
+                      stream.write("")
+                      return
+
+                  writer = csv.DictWriter(
+                      stream,
+                      fieldnames=fieldnames
+                  )
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          organization_file = (
+              evidence
+              / "enterprise"
+              / "organization-list.txt"
+          )
+
+          organizations = [
+              value.strip()
+              for value in organization_file.read_text(
+                  encoding="utf-8"
+              ).splitlines()
+              if value.strip()
+          ]
+
+          license_assessment = load_json(
+              evidence
+              / "enterprise"
+              / "license-assessment.json",
+              {}
+          )
+
+          organizations_report = []
+          repositories_report = []
+          officers_report = []
+          gaps_report = []
+
+          for organization in organizations:
+              safe_org = "".join(
+                  character
+                  if character.isalnum()
+                  or character in "._-"
+                  else "_"
+                  for character in organization
+              )
+
+              organization_dir = (
+                  evidence
+                  / "organizations"
+                  / safe_org
+              )
+              officer_dir = (
+                  evidence
+                  / "security-officers"
+                  / safe_org
+              )
+              repository_dir = (
+                  evidence
+                  / "repositories"
+                  / safe_org
+              )
+              error_file = (
+                  evidence
+                  / "errors"
+                  / f"{safe_org}.log"
+              )
+
+              organization_data = load_json(
+                  organization_dir / "organization.json",
+                  {}
+              )
+
+              owners = load_json(
+                  officer_dir / "owners.json",
+                  []
+              )
+
+              security_teams = load_json(
+                  officer_dir / "security-manager-teams.json",
+                  []
+              )
+
+              security_members = load_json(
+                  officer_dir / "security-manager-members.json",
+                  []
+              )
+
+              repositories = load_json(
+                  repository_dir / "repository-security.json",
+                  []
+              )
+
+              api_errors = ""
+
+              if error_file.exists():
+                  api_errors = error_file.read_text(
+                      encoding="utf-8"
+                  ).strip().replace("\n", " | ")
+
+              eligible_count = 0
+              enabled_count = 0
+              unknown_count = 0
+
+              for repository in repositories:
+                  archived = bool(
+                      repository.get("archived", False)
+                  )
+                  fork = bool(
+                      repository.get("fork", False)
+                  )
+                  visibility = repository.get(
+                      "visibility",
+                      "private"
+                      if repository.get("private")
+                      else "public"
+                  )
+                  disabled = bool(
+                      repository.get("disabled", False)
+                  )
+
+                  eligibility_reasons = []
+
+                  eligible = True
+
+                  if disabled:
+                      eligible = False
+                      eligibility_reasons.append(
+                          "repository_disabled"
+                      )
+
+                  if archived and not include_archived:
+                      eligible = False
+                      eligibility_reasons.append(
+                          "archived_excluded"
+                      )
+
+                  if fork and not include_forks:
+                      eligible = False
+                      eligibility_reasons.append(
+                          "fork_excluded"
+                      )
+
+                  if (
+                      private_only
+                      and visibility not in (
+                          "private",
+                          "internal"
+                      )
+                  ):
+                      eligible = False
+                      eligibility_reasons.append(
+                          "public_repository_excluded"
+                      )
+
+                  advanced_security = nested(
+                      repository,
+                      "security_and_analysis",
+                      "advanced_security",
+                      "status",
+                      default="unknown"
+                  )
+
+                  code_scanning = nested(
+                      repository,
+                      "security_and_analysis",
+                      "code_security",
+                      "status",
+                      default="unknown"
+                  )
+
+                  secret_scanning = nested(
+                      repository,
+                      "security_and_analysis",
+                      "secret_scanning",
+                      "status",
+                      default="unknown"
+                  )
+
+                  push_protection = nested(
+                      repository,
+                      "security_and_analysis",
+                      "secret_scanning_push_protection",
+                      "status",
+                      default="unknown"
+                  )
+
+                  dependency_graph = nested(
+                      repository,
+                      "security_and_analysis",
+                      "dependency_graph",
+                      "status",
+                      default="unknown"
+                  )
+
+                  if eligible:
+                      eligible_count += 1
+
+                  if advanced_security == "enabled":
+                      enabled_count += 1
+                  elif advanced_security == "unknown":
+                      unknown_count += 1
+
+                  gap = ""
+
+                  if eligible and advanced_security == "disabled":
+                      gap = "eligible_repository_without_ghas"
+
+                  if eligible and advanced_security == "unknown":
+                      gap = "ghas_status_unconfirmed"
+
+                  repository_row = {
+                      "enterprise": os.environ["ENTERPRISE"],
+                      "organization": organization,
+                      "repository": repository.get(
+                          "name",
+                          ""
+                      ),
+                      "full_name": repository.get(
+                          "full_name",
+                          ""
+                      ),
+                      "visibility": visibility,
+                      "archived": archived,
+                      "fork": fork,
+                      "disabled": disabled,
+                      "eligible": eligible,
+                      "eligibility_exclusions": ";".join(
+                          eligibility_reasons
+                      ),
+                      "advanced_security": advanced_security,
+                      "code_security": code_scanning,
+                      "secret_scanning": secret_scanning,
+                      "push_protection": push_protection,
+                      "dependency_graph": dependency_graph,
+                      "governance_gap": gap,
+                      "repository_url": repository.get(
+                          "html_url",
+                          ""
+                      )
+                  }
+
+                  repositories_report.append(repository_row)
+
+                  if gap:
+                      gaps_report.append({
+                          "enterprise": os.environ["ENTERPRISE"],
+                          "organization": organization,
+                          "repository": repository.get(
+                              "name",
+                              ""
+                          ),
+                          "gap": gap,
+                          "recommended_action": (
+                              "Confirm GHAS entitlement and apply "
+                              "the organization security baseline."
+                              if gap == "eligible_repository_without_ghas"
+                              else
+                              "Validate token permissions and GHES "
+                              "version support for security_and_analysis."
+                          )
+                      })
+
+              for owner in owners:
+                  officers_report.append({
+                      "enterprise": os.environ["ENTERPRISE"],
+                      "organization": organization,
+                      "officer_type": "organization_owner",
+                      "team": "",
+                      "login": owner.get("login", ""),
+                      "user_id": owner.get("id", ""),
+                      "profile_url": owner.get(
+                          "html_url",
+                          ""
+                      )
+                  })
+
+              for team in security_teams:
+                  if not isinstance(team, dict):
+                      continue
+
+                  officers_report.append({
+                      "enterprise": os.environ["ENTERPRISE"],
+                      "organization": organization,
+                      "officer_type": "security_manager_team",
+                      "team": team.get(
+                          "slug",
+                          team.get("name", "")
+                      ),
+                      "login": "",
+                      "user_id": team.get("id", ""),
+                      "profile_url": team.get(
+                          "html_url",
+                          ""
+                      )
+                  })
+
+              for member in security_members:
+                  officers_report.append({
+                      "enterprise": os.environ["ENTERPRISE"],
+                      "organization": organization,
+                      "officer_type": "security_manager_member",
+                      "team": member.get(
+                          "security_manager_team",
+                          ""
+                      ),
+                      "login": member.get("login", ""),
+                      "user_id": member.get("id", ""),
+                      "profile_url": member.get(
+                          "html_url",
+                          ""
+                      )
+                  })
+
+              security_officer_confirmed = bool(
+                  security_teams or security_members
+              )
+
+              organization_gap = ""
+
+              if not security_officer_confirmed:
+                  organization_gap = (
+                      "no_dedicated_security_manager_confirmed"
+                  )
+
+                  gaps_report.append({
+                      "enterprise": os.environ["ENTERPRISE"],
+                      "organization": organization,
+                      "repository": "",
+                      "gap": organization_gap,
+                      "recommended_action": (
+                          "Assign a dedicated security manager team "
+                          "or document organization owners as the "
+                          "approved security governance fallback."
+                      )
+                  })
+
+              organizations_report.append({
+                  "enterprise": os.environ["ENTERPRISE"],
+                  "organization": organization,
+                  "organization_name": organization_data.get(
+                      "name",
+                      ""
+                  ),
+                  "repository_count": len(repositories),
+                  "eligible_repository_count": eligible_count,
+                  "ghas_enabled_repository_count": enabled_count,
+                  "ghas_unknown_repository_count": unknown_count,
+                  "organization_owner_count": len(owners),
+                  "security_manager_team_count": len(
+                      security_teams
+                  ),
+                  "security_manager_member_count": len(
+                      security_members
+                  ),
+                  "security_officer_confirmed": (
+                      security_officer_confirmed
+                  ),
+                  "governance_gap": organization_gap,
+                  "api_errors_detected": bool(api_errors)
+              })
+
+          eligible_total = sum(
+              1
+              for row in repositories_report
+              if row["eligible"]
+          )
+
+          enabled_eligible_total = sum(
+              1
+              for row in repositories_report
+              if (
+                  row["eligible"]
+                  and row["advanced_security"] == "enabled"
+              )
+          )
+
+          security_officer_org_total = sum(
+              1
+              for row in organizations_report
+              if row["security_officer_confirmed"]
+          )
+
+          summary = {
+              "product": "GitHub Enterprise Server",
+              "github_hostname": os.environ["GH_HOST"],
+              "ghes_version": os.environ.get(
+                  "GHES_VERSION",
+                  "unknown"
+              ),
+              "enterprise": os.environ["ENTERPRISE"],
+              "license_status": license_assessment.get(
+                  "status",
+                  "unknown"
+              ),
+              "organization_count": len(
+                  organizations_report
+              ),
+              "repository_count": len(
+                  repositories_report
+              ),
+              "eligible_repository_count": eligible_total,
+              "eligible_repositories_with_ghas": (
+                  enabled_eligible_total
+              ),
+              "eligible_repositories_without_confirmed_ghas": (
+                  eligible_total - enabled_eligible_total
+              ),
+              "organizations_with_security_officer": (
+                  security_officer_org_total
+              ),
+              "organizations_without_security_officer": (
+                  len(organizations_report)
+                  - security_officer_org_total
+              ),
+              "organization_owner_assignments": sum(
+                  row["organization_owner_count"]
+                  for row in organizations_report
+              ),
+              "security_manager_team_assignments": sum(
+                  row["security_manager_team_count"]
+                  for row in organizations_report
+              ),
+              "security_manager_member_assignments": sum(
+                  row["security_manager_member_count"]
+                  for row in organizations_report
+              ),
+              "governance_gap_count": len(gaps_report)
+          }
+
+          write_csv(
+              evidence / "organizations.csv",
+              organizations_report
+          )
+          write_csv(
+              evidence / "eligible-repositories.csv",
+              repositories_report
+          )
+          write_csv(
+              evidence / "security-officers.csv",
+              officers_report,
+              [
+                  "enterprise",
+                  "organization",
+                  "officer_type",
+                  "team",
+                  "login",
+                  "user_id",
+                  "profile_url"
+              ]
+          )
+          write_csv(
+              evidence / "governance-gaps.csv",
+              gaps_report,
+              [
+                  "enterprise",
+                  "organization",
+                  "repository",
+                  "gap",
+                  "recommended_action"
+              ]
+          )
+
+          with (
+              evidence / "summary.json"
+          ).open("w", encoding="utf-8") as stream:
+              json.dump(
+                  summary,
+                  stream,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+          with (
+              evidence / "organizations.json"
+          ).open("w", encoding="utf-8") as stream:
+              json.dump(
+                  organizations_report,
+                  stream,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+          with (
+              evidence / "eligible-repositories.json"
+          ).open("w", encoding="utf-8") as stream:
+              json.dump(
+                  repositories_report,
+                  stream,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+          with (
+              evidence / "security-officers.json"
+          ).open("w", encoding="utf-8") as stream:
+              json.dump(
+                  officers_report,
+                  stream,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+          print(json.dumps(summary, indent=2))
+          PYTHON
+
+      # =============================================================
+      # 13. Generate Markdown report
+      # =============================================================
+
+      - name: Generate audit report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PYTHON'
+          import csv
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = Path(os.environ["EVIDENCE_DIR"])
+
+          with (
+              evidence / "summary.json"
+          ).open(encoding="utf-8") as stream:
+              summary = json.load(stream)
+
+          with (
+              evidence / "organizations.csv"
+          ).open(encoding="utf-8") as stream:
+              organizations = list(csv.DictReader(stream))
+
+          lines = [
+              "# GHES GHAS Governance Audit",
+              "",
+              "## Scope",
+              "",
+              f"**GHES instance:** {summary['github_hostname']}",
+              "",
+              f"**GHES version:** {summary['ghes_version']}",
+              "",
+              f"**Enterprise:** {summary['enterprise']}",
+              "",
+              "## Executive summary",
+              "",
+              "| Control | Result |",
+              "|---|---:|",
+              f"| License status | {summary['license_status']} |",
+              f"| Organizations | {summary['organization_count']} |",
+              f"| Repositories | {summary['repository_count']} |",
+              (
+                  "| Eligible repositories "
+                  f"| {summary['eligible_repository_count']} |"
+              ),
+              (
+                  "| Eligible repositories with GHAS "
+                  f"| {summary['eligible_repositories_with_ghas']} |"
+              ),
+              (
+                  "| Eligible repositories without confirmed GHAS "
+                  f"| {summary['eligible_repositories_without_confirmed_ghas']} |"
+              ),
+              (
+                  "| Organizations with a security officer "
+                  f"| {summary['organizations_with_security_officer']} |"
+              ),
+              (
+                  "| Organizations without a security officer "
+                  f"| {summary['organizations_without_security_officer']} |"
+              ),
+              (
+                  "| Governance gaps "
+                  f"| {summary['governance_gap_count']} |"
+              ),
+              "",
+              "## Organization assessment",
+              "",
+              (
+                  "| Organization | Repositories | Eligible | GHAS enabled "
+                  "| Owners | Security teams | Security officers | Gap |"
+              ),
+              "|---|---:|---:|---:|---:|---:|---|---|"
+          ]
+
+          for organization in organizations:
+              lines.append(
+                  f"| {organization['organization']} "
+                  f"| {organization['repository_count']} "
+                  f"| {organization['eligible_repository_count']} "
+                  f"| {organization['ghas_enabled_repository_count']} "
+                  f"| {organization['organization_owner_count']} "
+                  f"| {organization['security_manager_team_count']} "
+                  f"| {organization['security_officer_confirmed']} "
+                  f"| {organization['governance_gap'] or 'None'} |"
+              )
+
+          lines.extend([
+              "",
+              "## Interpretation",
+              "",
+              (
+                  "- `confirmed_by_license_endpoint` means the administrative "
+                  "license response contains evidence related to GHAS."
+              ),
+              (
+                  "- `functionally_observed` means at least one GHAS API was "
+                  "successfully reached, but seat entitlement has not been "
+                  "authoritatively confirmed."
+              ),
+              (
+                  "- `requires_administrative_confirmation` means the API "
+                  "could not provide conclusive licensing evidence."
+              ),
+              (
+                  "- Eligibility is calculated using repository state, "
+                  "visibility and the workflow inclusion policy. Final "
+                  "commercial eligibility must be checked against the "
+                  "organization's GHES and GHAS agreement."
+              ),
+              (
+                  "- Organization owners are reported separately from "
+                  "dedicated security managers. Owners are not automatically "
+                  "treated as dedicated security officers."
+              )
+          ])
+
+          report = "\n".join(lines) + "\n"
+
+          (evidence / "README.md").write_text(
+              report,
+              encoding="utf-8"
+          )
+
+          with open(
+              os.environ["GITHUB_STEP_SUMMARY"],
+              "a",
+              encoding="utf-8"
+          ) as stream:
+              stream.write(report)
+          PYTHON
+
+      # =============================================================
+      # 14. Validate evidence
+      # =============================================================
+
+      - name: Validate evidence package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUIRED_FILES=(
+            "${EVIDENCE_DIR}/metadata.json"
+            "${EVIDENCE_DIR}/summary.json"
+            "${EVIDENCE_DIR}/README.md"
+            "${EVIDENCE_DIR}/organizations.csv"
+            "${EVIDENCE_DIR}/eligible-repositories.csv"
+            "${EVIDENCE_DIR}/security-officers.csv"
+            "${EVIDENCE_DIR}/governance-gaps.csv"
+            "${EVIDENCE_DIR}/enterprise/license-assessment.json"
+          )
+
+          for FILE_PATH in "${REQUIRED_FILES[@]}"
+          do
+            if [[ ! -f "${FILE_PATH}" ]]; then
+              echo "::error::Missing evidence file: ${FILE_PATH}"
+              exit 1
+            fi
+          done
+
+          jq empty "${EVIDENCE_DIR}/metadata.json"
+          jq empty "${EVIDENCE_DIR}/summary.json"
+          jq empty \
+            "${EVIDENCE_DIR}/enterprise/license-assessment.json"
+
+          echo "Evidence package validated."
+
+      # =============================================================
+      # 15. Package downloadable evidence
+      # =============================================================
+
+      - name: Package evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE_NAME="ghes-ghas-governance-${ENTERPRISE}-${GITHUB_RUN_ID}.tar.gz"
+
+          tar \
+            -czf "${ARCHIVE_NAME}" \
+            "${EVIDENCE_DIR}"
+
+          sha256sum "${ARCHIVE_NAME}" \
+            > "${ARCHIVE_NAME}.sha256"
+
+          cp \
+            "${ARCHIVE_NAME}.sha256" \
+            "${EVIDENCE_DIR}/evidence-package.sha256"
+
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "${GITHUB_ENV}"
+
+      # =============================================================
+      # 16. Upload downloadable artifact
+      #
+      # For GHES, mirror or pin upload-artifact to a version supported
+      # by the installed GHES release.
+      # =============================================================
+
+      - name: Upload GHAS governance artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghes-ghas-governance-${{ inputs.enterprise }}-${{ github.run_id }}
+          path: |
+            ghes-ghas-governance-evidence/
+            ghes-ghas-governance-${{ inputs.enterprise }}-${{ github.run_id }}.tar.gz
+            ghes-ghas-governance-${{ inputs.enterprise }}-${{ github.run_id }}.tar.gz.sha256
+          retention-days: 90
+          if-no-files-found: error
+
+      # =============================================================
+      # 17. Optional governance gate
+      # =============================================================
+
+      - name: Evaluate governance gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "${EVIDENCE_DIR}/summary.json" ]]; then
+            echo "::error::Summary was not generated."
+            exit 1
+          fi
+
+          GAP_COUNT=$(
+            jq -r '.governance_gap_count' \
+              "${EVIDENCE_DIR}/summary.json"
+          )
+
+          UNLICENSED_COUNT=$(
+            jq -r \
+              '.eligible_repositories_without_confirmed_ghas' \
+              "${EVIDENCE_DIR}/summary.json"
+          )
+
+          MISSING_OFFICERS=$(
+            jq -r \
+              '.organizations_without_security_officer' \
+              "${EVIDENCE_DIR}/summary.json"
+          )
+
+          echo "Governance gaps: ${GAP_COUNT}"
+          echo "Eligible repositories without confirmed GHAS: ${UNLICENSED_COUNT}"
+          echo "Organizations without security officers: ${MISSING_OFFICERS}"
+
+          if [[ "${GAP_COUNT}" -gt 0 ]]; then
+            echo "::warning::GHAS governance gaps were detected."
+          fi
+
+          if [[ "${FAIL_ON_GAPS}" == "true" && "${GAP_COUNT}" -gt 0 ]]; then
+            echo "::error::GHAS governance gate failed."
+            exit 1
+          fi
